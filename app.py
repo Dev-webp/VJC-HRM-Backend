@@ -10,10 +10,12 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET") or "fallback-secret-key"
-CORS(app, supports_credentials=True, origins=[
-    "https://postgres-frontend-attendance.vercel.app",
-    "https://postgres-frontend-attendance-nuthan472.vercel.app"
-])
+
+app.config.update(
+    SESSION_COOKIE_SAMESITE="None",
+    SESSION_COOKIE_SECURE=True
+)
+CORS(app, supports_credentials=True, origins=["https://postgres-frontend-attendance.vercel.app"])
 
 
 @app.route("/", methods=["GET", "POST"])
@@ -186,4 +188,5 @@ def update_profile_image():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
+
 
