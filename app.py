@@ -15,7 +15,7 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="None",
     SESSION_COOKIE_SECURE=True
 )
-CORS(app, supports_credentials=True, origins=["https://postgres-frontend-attendance.vercel.app"])
+CORS(app, supports_credentials=True, origins=["https://postgres-frontend-attendance.onrender.com"])
 
 
 @app.route("/", methods=["GET", "POST"])

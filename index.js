@@ -5,7 +5,7 @@ const app = express();
 
 // ✅ 1. Enable CORS for your frontend
 app.use(cors({
-  origin: 'https://postgres-frontend-attendance.vercel.app',
+  origin: 'https://postgres-frontend-attendance.onrender.com',
   credentials: true
 }));
 
