@@ -10,7 +10,7 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET") or "fallback-secret-key"
-CORS(app, supports_credentials=True)
+CORS(app, supports_credentials=True,origins=["https://postgres-frontend-attendance.vercel.app/"])
 
 @app.route("/", methods=["GET", "POST"])
 def login():
