@@ -24,29 +24,48 @@ CORS(app, supports_credentials=True, resources={
     }
 })
 
-
 @app.route("/", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
         return "✅ Backend running. Use POST to login."
 
-    email = request.form.get("email")
-    password = request.form.get("password")
+    try:
+        # Extract data safely
+        email = request.form.get("email")
+        password = request.form.get("password")
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT user_id, password, role FROM users WHERE email = %s", (email,))
-    user = cur.fetchone()
-    cur.close()
-    conn.close()
+        print("📨 Login request received for email:", email)
 
-    if user and password == user[1]:
+        if not email or not password:
+            return jsonify({"message": "❌ Email and password are required"}), 400
+
+        # Connect to DB and fetch user
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT user_id, password, role FROM users WHERE email = %s", (email,))
+        user = cur.fetchone()
+        cur.close()
+        conn.close()
+
+        if not user:
+            print("❌ No user found for email:", email)
+            return jsonify({"message": "Invalid email"}), 401
+
+        if password != user[1]:
+            print("❌ Password mismatch for user:", email)
+            return jsonify({"message": "Invalid password"}), 401
+
+        # Success: Set session
         session["user_id"] = user[0]
         session["role"] = user[2]
         session["email"] = email
+
+        print("✅ Login successful for:", email)
         return jsonify({"message": "Login successful"}), 200
 
-    return jsonify({"message": "❌ Invalid credentials"}), 401
+    except Exception as e:
+        print("🔥 Internal Server Error:", str(e))
+        return jsonify({"message": f"Internal Server Error: {str(e)}"}), 500
 
 
 @app.route("/dashboard")
