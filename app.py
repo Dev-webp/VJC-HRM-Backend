@@ -26,42 +26,9 @@ def login():
     if request.method == "GET":
         return "✅ Backend running. Use POST to login."
 
-    try:
-        email = request.form.get("email")
-        password = request.form.get("password")
-
-        print("📨 Login attempt:", email)
-
-        if not email or not password:
-            print("❌ Missing email or password")
-            return jsonify({"message": "Email and password required"}), 400
-
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT user_id, password, role FROM users WHERE email = %s", (email,))
-        user = cur.fetchone()
-        cur.close()
-        conn.close()
-
-        if not user:
-            print(f"❌ No user found for email: {email}")
-            return jsonify({"message": "Invalid credentials"}), 401
-
-        if password != user[1]:
-            print(f"❌ Password incorrect for: {email}")
-            return jsonify({"message": "Invalid credentials"}), 401
-
-        session["user_id"] = user[0]
-        session["role"] = user[2]
-        session["email"] = email
-
-        print(f"✅ Login successful for: {email}")
-        return jsonify({"message": "Login successful"}), 200
-
-    except Exception as e:
-        import traceback
-        print("🔥 Internal Server Error:\n", traceback.format_exc())
-        return jsonify({"message": f"Internal Server Error: {str(e)}"}), 500
+    email = request.form.get("email")
+    password = request.form.get("password")
+    print("Login attempt:", email, password)  # <- for Render logs
 
 
 @app.route("/dashboard")
