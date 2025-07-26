@@ -18,11 +18,9 @@ app.config.update(
 )
 
 # ✅ Apply CORS to all routes, with frontend origin and credentials support
-CORS(app, credentials=True, resources={
-    r"/*": {
-        "origins": "https://postgres-frontend-attendance.onrender.com"
-    }
-})
+
+CORS(app, resources={r"/*": {"origins": "https://postgres-frontend-attendance.onrender.com"}}, supports_credentials=True)
+
 @app.route("/", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
