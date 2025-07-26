@@ -1,4 +1,4 @@
-from flask import Flask, request, session, jsonify
+from flask import Flask, request, session, jsonify, redirect
 from flask_cors import CORS
 from datetime import datetime, date
 from db import get_db_connection
@@ -10,16 +10,17 @@ load_dotenv()
 
 app = Flask(__name__)
 app.secret_key = os.getenv("FLASK_SECRET") or "fallback-secret-key"
+CORS(app, supports_credentials=True, origins=[
+    "https://postgres-frontend-attendance.vercel.app",  # your Vercel domain
+    "https://postgres-frontend-attendance.onrender.com"  # if hosted on Render
+])
 
-# ✅ Session cookie config for cross-origin requests
+# SameSite + Secure config for Render HTTPS session cookies
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",
     SESSION_COOKIE_SECURE=True
 )
 
-# ✅ Apply CORS to all routes, with frontend origin and credentials support
-
-CORS(app, resources={r"/*": {"origins": "https://postgres-frontend-attendance.onrender.com"}}, supports_credentials=True)
 
 @app.route("/", methods=["GET", "POST"])
 def login():
@@ -28,18 +29,21 @@ def login():
 
     email = request.form.get("email")
     password = request.form.get("password")
-    print("Login attempt:", email, password)  # <- for Render logs
 
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, password, role FROM users WHERE email = %s", (email,))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
 
-@app.route("/dashboard")
-def dashboard():
-    if "user_id" not in session:
-        return jsonify({"message": "Not logged in"}), 401
+    if user and password == user[1]:
+        session["user_id"] = user[0]
+        session["role"] = user[2]
+        session["email"] = email
+        return redirect("/dashboard")
 
-    return jsonify({
-        "redirect": "chairman" if session["role"] == "chairman" else "employee"
-    })
-
+    return "❌ Invalid credentials", 401
 
 @app.route("/register", methods=["POST"])
 def register():
@@ -48,7 +52,7 @@ def register():
     password = request.form.get("password")
 
     if not email.endswith("@vjcoverseas.com"):
-        return jsonify({"message": "❌ Only company emails allowed"}), 400
+        return "❌ Only company emails allowed", 400
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -60,18 +64,17 @@ def register():
         conn.commit()
     except Exception as e:
         conn.rollback()
-        return jsonify({"message": f"❌ Error: {str(e)}"}), 500
+        return f"❌ Error: {str(e)}", 500
     finally:
         cur.close()
         conn.close()
 
-    return jsonify({"message": "✅ Registered"}), 200
-
+    return "✅ Registered", 200
 
 @app.route("/attendance", methods=["POST"])
 def mark_attendance():
     if "user_id" not in session:
-        return jsonify({"message": "Not logged in"}), 401
+        return {"message": "Not logged in"}, 401
 
     user_id = session["user_id"]
     action = request.form.get("action")
@@ -80,7 +83,7 @@ def mark_attendance():
 
     valid_actions = ["office_in", "break_out", "break_in", "lunch_out", "lunch_in", "office_out"]
     if action not in valid_actions:
-        return jsonify({"message": "Invalid action"}), 400
+        return {"message": "Invalid action"}, 400
 
     conn = get_db_connection()
     cur = conn.cursor()
@@ -101,15 +104,14 @@ def mark_attendance():
             )
 
         conn.commit()
-        return jsonify({"message": f"{action} recorded"}), 200
+        return {"message": f"{action} recorded"}, 200
 
     except Exception as e:
         conn.rollback()
-        return jsonify({"message": f"❌ DB Error: {str(e)}"}), 500
+        return {"message": f"❌ DB Error: {str(e)}"}, 500
     finally:
         cur.close()
         conn.close()
-
 
 @app.route("/dashboard-data")
 def dashboard_data():
@@ -143,7 +145,16 @@ def dashboard_data():
         })
     return jsonify(result)
 
+@app.route("/dashboard")
+def dashboard():
+    if "user_id" not in session:
+        return redirect("/")
+    return jsonify({"redirect": "chairman" if session["role"] == "chairman" else "employee"})
 
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/")
 @app.route("/me")
 def me():
     if "user_id" not in session:
@@ -165,8 +176,6 @@ def me():
         })
     else:
         return jsonify({"message": "User not found"}), 404
-
-
 @app.route("/update-profile-image", methods=["POST"])
 def update_profile_image():
     if "user_id" not in session:
@@ -180,14 +189,5 @@ def update_profile_image():
     cur.close()
     conn.close()
     return jsonify({"message": "Image updated"}), 200
-
-
-@app.route("/logout")
-def logout():
-    session.clear()
-    return jsonify({"message": "Logged out"})
-
-
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(debug=True)
