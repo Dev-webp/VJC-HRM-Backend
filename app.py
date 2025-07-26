@@ -18,28 +18,26 @@ app.config.update(
 )
 
 # ✅ Apply CORS to all routes, with frontend origin and credentials support
-CORS(app, supports_credentials=True, resources={
+CORS(app, credentials=True, resources={
     r"/*": {
         "origins": "https://postgres-frontend-attendance.onrender.com"
     }
 })
-
 @app.route("/", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
         return "✅ Backend running. Use POST to login."
 
     try:
-        # Extract data safely
         email = request.form.get("email")
         password = request.form.get("password")
 
-        print("📨 Login request received for email:", email)
+        print("📨 Login attempt:", email)
 
         if not email or not password:
-            return jsonify({"message": "❌ Email and password are required"}), 400
+            print("❌ Missing email or password")
+            return jsonify({"message": "Email and password required"}), 400
 
-        # Connect to DB and fetch user
         conn = get_db_connection()
         cur = conn.cursor()
         cur.execute("SELECT user_id, password, role FROM users WHERE email = %s", (email,))
@@ -48,23 +46,23 @@ def login():
         conn.close()
 
         if not user:
-            print("❌ No user found for email:", email)
-            return jsonify({"message": "Invalid email"}), 401
+            print(f"❌ No user found for email: {email}")
+            return jsonify({"message": "Invalid credentials"}), 401
 
         if password != user[1]:
-            print("❌ Password mismatch for user:", email)
-            return jsonify({"message": "Invalid password"}), 401
+            print(f"❌ Password incorrect for: {email}")
+            return jsonify({"message": "Invalid credentials"}), 401
 
-        # Success: Set session
         session["user_id"] = user[0]
         session["role"] = user[2]
         session["email"] = email
 
-        print("✅ Login successful for:", email)
+        print(f"✅ Login successful for: {email}")
         return jsonify({"message": "Login successful"}), 200
 
     except Exception as e:
-        print("🔥 Internal Server Error:", str(e))
+        import traceback
+        print("🔥 Internal Server Error:\n", traceback.format_exc())
         return jsonify({"message": f"Internal Server Error: {str(e)}"}), 500
 
 
