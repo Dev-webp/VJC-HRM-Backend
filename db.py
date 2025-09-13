@@ -38,7 +38,7 @@ CORS(
     supports_credentials=True,
     origins=[
         "http://localhost:3000",
-        "https://postgres-frontend-attendance.vercel.app",
+        "http://hrm.vjcoverseas.com",
         "https://postgres-frontend-attendance.onrender.com",
     ],
 )

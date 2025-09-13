@@ -56,16 +56,16 @@ OFFER_LETTER_FOLDER = os.path.join(os.getcwd(), "uploads", "offer_letters")
 os.makedirs(OFFER_LETTER_FOLDER, exist_ok=True)
 # CORS setup
 CORS(app, supports_credentials=True, origins=[
-    "https://postgres-frontend-attendance.vercel.app",
-    "https://postgres-frontend-attendance.onrender.com",
+    "http://crm.vjcoverseas.com",
+    "https://crm.vjcoverseas.com",
     "http://localhost:3000"
 ])
 
-# Session cookie config
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",
     SESSION_COOKIE_SECURE=True
 )
+
 
 # ---------------------- AUTH & SESSION ----------------------
 PROFILE_UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads", "profile_images")
@@ -268,7 +268,7 @@ def upload_salary_slip():
 def my_salary_slips():
     """
     Returns slips for the logged-in user's email.
-    Used by your EmployeeDashboard: axios.get('http://localhost:5000/my-salary-slips')
+    Used by your EmployeeDashboard: axios.get('http://backend.vjcoverseas.com/my-salary-slips')
     """
     if "user_id" not in session:
         return jsonify({"message": "Not logged in"}), 401
