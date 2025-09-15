@@ -1,17 +1,15 @@
-import psycopg2
 import os
-from dotenv import load_dotenv
-
-load_dotenv()
+import psycopg2
 
 def get_db_connection():
     return psycopg2.connect(
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT")
+        user=os.getenv('DB_USER'),
+        password=os.getenv('DB_PASSWORD'),
+        host=os.getenv('DB_HOST'),
+        port=os.getenv('DB_PORT'),
+        dbname=os.getenv('DB_NAME'),
     )
+
 # app.py
 from flask import Flask, request, session, jsonify, redirect, send_from_directory
 from flask_cors import CORS, cross_origin
@@ -39,7 +37,7 @@ CORS(
     origins=[
         "http://localhost:3000",
         "http://hrm.vjcoverseas.com",
-        "https://postgres-frontend-attendance.onrender.com",
+        "http://hrm.vjcoverseas.com",
     ],
 )
 
