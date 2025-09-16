@@ -268,7 +268,7 @@ def upload_salary_slip():
 def my_salary_slips():
     """
     Returns slips for the logged-in user's email.
-    Used by your EmployeeDashboard: axios.get('http://backend.vjcoverseas.com/my-salary-slips')
+    Used by your EmployeeDashboard: axios.get('https://backend.vjcoverseas.com/my-salary-slips')
     """
     if "user_id" not in session:
         return jsonify({"message": "Not logged in"}), 401
@@ -964,14 +964,31 @@ def delete_holiday(date):
 def get_holidays():
     month = request.args.get("month")  # "YYYY-MM"
     print("Fetching holidays for month:", month)
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY-MM') = %s", (month,))
-    holidays = [{"date": r[0].strftime("%Y-%m-%d"), "name": r[1], "is_paid": r[2]} for r in cur.fetchall()]
-    print("Found holidays:", holidays)
-    cur.close()
-    conn.close()
-    return jsonify(holidays)
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY-MM') = %s", (month,))
+        rows = cur.fetchall()
+        
+        holidays = []
+        for r in rows:
+            date_value = r[0]
+            # Defensive conversion: use strftime if possible, else convert to string
+            if hasattr(date_value, 'strftime'):
+                date_str = date_value.strftime("%Y-%m-%d")
+            else:
+                date_str = str(date_value)
+            
+            holidays.append({"date": date_str, "name": r[1], "is_paid": r[2]})
+
+        print("Found holidays:", holidays)
+        cur.close()
+        conn.close()
+        return jsonify(holidays)
+    except Exception as e:
+        print("Error fetching holidays:", e)
+        return jsonify({"message": "Server error fetching holidays"}), 500
+
 
 @app.route('/save-attendance-summary', methods=['POST'])
 def save_attendance_summary():
