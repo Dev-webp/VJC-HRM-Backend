@@ -58,10 +58,12 @@ OFFER_LETTER_FOLDER = os.path.join(os.getcwd(), "uploads", "offer_letters")
 os.makedirs(OFFER_LETTER_FOLDER, exist_ok=True)
 # CORS setup
 CORS(app, supports_credentials=True, origins=[
-    "http://hrm.vjcoverseas.com",
-    "https://hrm.vjcoverseas.com",
-    "http://localhost:3000"
+    "http://hrm.vjcoveras.com",
+    "https://hrm.vjcoveras.com",
+    "http://localhost:3000",
+    "https://backend.vjcoveras.com"
 ])
+
 
 app.config.update(
     SESSION_COOKIE_SAMESITE="None",
