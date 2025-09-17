@@ -890,34 +890,46 @@ app.config.update(
 
 @app.route("/dashboard-data")
 def dashboard_data():
-    print("Session contents:", dict(session))
-    if session.get("role") != "chairman":
-        return jsonify({"message": "Access denied"}), 403
+    try:
+        print("Session contents:", dict(session))
+        if session.get("role") != "chairman":
+            return jsonify({"message": "Access denied"}), 403
 
-    conn = get_db_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT u.name, u.email, a.date, a.office_in, a.break_out, a.break_in, a.lunch_out, a.lunch_in, a.office_out ,a.paid_leave_reason
-        FROM attendance a
-        JOIN users u ON u.user_id = a.user_id
-        ORDER BY a.date DESC
-    """)
-    rows = cur.fetchall()
-    cur.close()
-    put_db_connection(conn)
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT u.name, u.email, a.date, a.office_in, a.break_out, a.break_in, a.lunch_out, a.lunch_in, a.office_out ,a.paid_leave_reason
+            FROM attendance a
+            JOIN users u ON u.user_id = a.user_id
+            ORDER BY a.date DESC
+        """)
+        rows = cur.fetchall()
+        cur.close()
+        put_db_connection(conn)
 
-    return jsonify([{
-        "name": row[0],
-        "email": row[1],
-        "date": row[2].strftime("%Y-%m-%d"),
-        "office_in": str(row[3]) if row[3] else "",
-        "break_out": str(row[4]) if row[4] else "",
-        "break_in": str(row[5]) if row[5] else "",
-        "lunch_out": str(row[6]) if row[6] else "",
-        "lunch_in": str(row[7]) if row[7] else "",
-        "office_out": str(row[8]) if row[8] else "",
-        "leave_type": row[9] if row[9] else None,
-    } for row in rows])
+        data = []
+        for row in rows:
+            try:
+                data.append({
+                    "name": row[0],
+                    "email": row[1],
+                    "date": row[2].strftime("%Y-%m-%d") if row[2] else "",
+                    "office_in": str(row[3]) if row[3] else "",
+                    "break_out": str(row[4]) if row[4] else "",
+                    "break_in": str(row[5]) if row[5] else "",
+                    "lunch_out": str(row[6]) if row[6] else "",
+                    "lunch_in": str(row[7]) if row[7] else "",
+                    "office_out": str(row[8]) if row[8] else "",
+                    "leave_type": row[9] if row[9] else None,
+                })
+            except Exception as row_err:
+                print("Row formatting error:", row_err)
+
+        return jsonify(data)
+
+    except Exception as e:
+        print("Unhandled error in dashboard_data:", e)
+        return jsonify({"error": "Internal Server Error"}), 500
 # In app.py
 
 # Paid Holidays Table (ensure in postgres: holidays(date, name, is_paid boolean))
