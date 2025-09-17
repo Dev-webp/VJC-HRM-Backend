@@ -961,46 +961,53 @@ def delete_holiday(date):
         cur.close()
         put_db_connection(conn)
 
-# Get paid holidays for month
 @app.route("/holidays")
 def get_holidays():
-    month = request.args.get("month")  # Expected "YYYY-MM" or maybe just "YYYY"
-    print("Fetching holidays for month/year:", month)
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
-        if month and len(month) == 7:  # "YYYY-MM"
-            cur.execute(
-                "SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY-MM') = %s",
-                (month,),
-            )
-        elif month and len(month) == 4:  # Only year given "YYYY"
-            cur.execute(
-                "SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY') = %s",
-                (month,),
-            )
-        else:
-            # If nothing or invalid format sent, fetch all (or none)
-            cur.execute("SELECT date, name, is_paid FROM holidays ORDER BY date")
+    month = request.args.get("month")  # "YYYY" or "YYYY-MM"
+    max_attempts = 3
 
-        rows = cur.fetchall()
-        holidays = []
-        for r in rows:
-            date_value = r[0]
-            date_str = (
-                date_value.strftime("%Y-%m-%d")
-                if hasattr(date_value, "strftime")
-                else str(date_value)
-            )
-            holidays.append({"date": date_str, "name": r[1], "is_paid": r[2]})
+    for attempt in range(max_attempts):
+        conn = None
+        cur = None
+        try:
+            conn = get_db_connection()
+            # Quick connection test to avoid stale connections
+            try:
+                with conn.cursor() as test_cur:
+                    test_cur.execute("SELECT 1")
+            except:
+                put_db_connection(conn)
+                conn = get_db_connection()
+            cur = conn.cursor()
 
-        print("Found holidays:", holidays)
-        cur.close()
-        put_db_connection(conn)
-        return jsonify(holidays)
-    except Exception as e:
-        print("Error fetching holidays:", e)
-        return jsonify({"message": "Server error fetching holidays"}), 500
+            if month and len(month) == 7:
+                cur.execute("SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY-MM') = %s", (month,))
+            elif month and len(month) == 4:
+                cur.execute("SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY') = %s", (month,))
+            else:
+                cur.execute("SELECT date, name, is_paid FROM holidays ORDER BY date")
+
+            rows = cur.fetchall()
+            holidays = [
+                {'date': r[0].strftime("%Y-%m-%d") if hasattr(r[0], 'strftime') else str(r[0]), 'name': r[1], 'is_paid': r[2]}
+                for r in rows
+            ]
+            cur.close()
+            put_db_connection(conn)
+            return jsonify(holidays)
+
+        except Exception as e:
+            print(f"Attempt {attempt+1}/{max_attempts} failed: {e}")
+            try:
+                if cur:
+                    cur.close()
+                if conn:
+                    put_db_connection(conn)
+            except:
+                pass
+
+    # After retries fail, return empty list so frontend doesn't error.
+    return jsonify([])
 
 
 @app.route('/save-attendance-summary', methods=['POST'])
