@@ -964,23 +964,34 @@ def delete_holiday(date):
 # Get paid holidays for month
 @app.route("/holidays")
 def get_holidays():
-    month = request.args.get("month")  # "YYYY-MM"
-    print("Fetching holidays for month:", month)
+    month = request.args.get("month")  # Expected "YYYY-MM" or maybe just "YYYY"
+    print("Fetching holidays for month/year:", month)
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY-MM') = %s", (month,))
+        if month and len(month) == 7:  # "YYYY-MM"
+            cur.execute(
+                "SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY-MM') = %s",
+                (month,),
+            )
+        elif month and len(month) == 4:  # Only year given "YYYY"
+            cur.execute(
+                "SELECT date, name, is_paid FROM holidays WHERE TO_CHAR(date, 'YYYY') = %s",
+                (month,),
+            )
+        else:
+            # If nothing or invalid format sent, fetch all (or none)
+            cur.execute("SELECT date, name, is_paid FROM holidays ORDER BY date")
+
         rows = cur.fetchall()
-        
         holidays = []
         for r in rows:
             date_value = r[0]
-            # Defensive conversion: use strftime if possible, else convert to string
-            if hasattr(date_value, 'strftime'):
-                date_str = date_value.strftime("%Y-%m-%d")
-            else:
-                date_str = str(date_value)
-            
+            date_str = (
+                date_value.strftime("%Y-%m-%d")
+                if hasattr(date_value, "strftime")
+                else str(date_value)
+            )
             holidays.append({"date": date_str, "name": r[1], "is_paid": r[2]})
 
         print("Found holidays:", holidays)
