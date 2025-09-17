@@ -1221,7 +1221,7 @@ def update_user(email):
         if cur:
             cur.close()
         if conn:
-            put_db_connection(conn)
+           conn.close()
 
 
 
