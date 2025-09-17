@@ -14,6 +14,8 @@ from flask import request, session, jsonify
 from flask_cors import cross_origin
 from decimal import Decimal
 from psycopg2.extras import RealDictCursor
+from db import get_db_connection, put_db_connection
+
 # Load environment variables
 def cleanup_orphaned_paid_leave_attendance():
     conn = get_db_connection()
@@ -45,7 +47,7 @@ def cleanup_orphaned_paid_leave_attendance():
         print("Cleanup error:", e)
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 load_dotenv()
 UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads", "salary_slips")
@@ -101,7 +103,7 @@ def upload_profile_image():
         )
         conn.commit()
         cur.close()
-        conn.close()
+        put_db_connection(conn)
         return jsonify({"message": "Profile image uploaded successfully", "image": db_path}), 200
     except Exception as e:
         return jsonify({"message": f"Error saving image: {str(e)}"}), 500
@@ -153,7 +155,7 @@ def upload_offer_letter():
         if cur:
             cur.close()
         if conn:
-            conn.close()
+            put_db_connection(conn)
 
 # The existing route to serve the files remains the same.
 @app.route("/files/offer_letters/<path:filename>")
@@ -177,7 +179,7 @@ def login():
     cur.execute("SELECT user_id, password, role FROM users WHERE email = %s", (email,))
     user = cur.fetchone()
     cur.close()
-    conn.close()
+    put_db_connection(conn)
 
     if user and password == user[1]:
         session["user_id"] = user[0]
@@ -261,7 +263,7 @@ def upload_salary_slip():
         if cur:
             cur.close()
         if conn:
-            conn.close()
+            put_db_connection(conn)
 
 
 @app.route("/my-salary-slips", methods=["GET"])
@@ -313,7 +315,7 @@ def my_salary_slips():
         return jsonify(items), 200
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 
 # Serve uploaded files (so links work in the frontend list)
@@ -366,7 +368,7 @@ def me():
         return jsonify({"message": str(e)}), 500
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 @app.route("/update-profile-image", methods=["POST"])
 def update_profile_image():
@@ -379,7 +381,7 @@ def update_profile_image():
     cur.execute("UPDATE users SET image = %s WHERE user_id = %s", (new_image, session["user_id"]))
     conn.commit()
     cur.close()
-    conn.close()
+    put_db_connection(conn)
     return jsonify({"message": "Image updated"}), 200
 
 @app.route("/register", methods=["POST"])
@@ -404,7 +406,7 @@ def register():
         return f"❌ Error: {str(e)}", 500
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
     return "✅ Registered", 200
 
@@ -465,7 +467,7 @@ def mark_attendance():
     
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 @app.route("/my-attendance")
 def my_attendance():
     if "user_id" not in session:
@@ -516,7 +518,7 @@ def my_attendance():
 
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
         
 @app.route("/all-attendance")
@@ -616,7 +618,7 @@ def all_attendance():
 
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 
 # ---------------------- LEAVE MANAGEMENT ----------------------
@@ -657,7 +659,7 @@ def apply_leave():
         return jsonify({"message": f"DB Error: {str(e)}"}), 500
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 @app.route("/my-leave-requests")
 def my_leave_requests():
@@ -674,7 +676,7 @@ def my_leave_requests():
     """, (session["user_id"],))
     rows = cur.fetchall()
     cur.close()
-    conn.close()
+    put_db_connection(conn)
 
     return jsonify([{
         "id": r[0],
@@ -720,7 +722,7 @@ def all_leave_requests():
         return jsonify(result)
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 @app.route("/leave-action", methods=["POST"])
 def leave_action():
@@ -795,7 +797,7 @@ def leave_action():
 
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 
 # ---------------------- CHAIRMAN DASHBOARD ----------------------
@@ -844,7 +846,7 @@ def create_user():
         return jsonify({"message": f"❌ DB Error: {str(e)}"}), 500
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
         
 @app.route("/delete-leave-request/<int:leave_id>", methods=["DELETE", "OPTIONS"])
@@ -878,7 +880,7 @@ def delete_leave_request(leave_id):
         return jsonify({"message": f"Deletion error: {str(e)}"}), 500
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 
 app.config.update(
@@ -902,7 +904,7 @@ def dashboard_data():
     """)
     rows = cur.fetchall()
     cur.close()
-    conn.close()
+    put_db_connection(conn)
 
     return jsonify([{
         "name": row[0],
@@ -935,7 +937,7 @@ def mark_holiday():
         (date, name, is_paid, name, is_paid))
     conn.commit()
     cur.close()
-    conn.close()
+    put_db_connection(conn)
     return jsonify({"message": "Holiday marked"}), 200
 @app.route("/delete-holiday/<date>", methods=["DELETE", "OPTIONS"])
 @cross_origin(supports_credentials=True)
@@ -957,7 +959,7 @@ def delete_holiday(date):
         return jsonify({"message": f"Error deleting holiday: {str(e)}"}), 500
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 # Get paid holidays for month
 @app.route("/holidays")
@@ -983,7 +985,7 @@ def get_holidays():
 
         print("Found holidays:", holidays)
         cur.close()
-        conn.close()
+        put_db_connection(conn)
         return jsonify(holidays)
     except Exception as e:
         print("Error fetching holidays:", e)
@@ -1023,7 +1025,7 @@ def save_attendance_summary():
         return jsonify({"message": "Summary saved"}), 200
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 from flask import request, jsonify, session
 from datetime import datetime
 from decimal import Decimal
@@ -1116,7 +1118,7 @@ def auto_generate_payroll():
 
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 
 from flask import request, session, jsonify
 from werkzeug.security import generate_password_hash
@@ -1201,7 +1203,7 @@ def update_user(email):
         if cur:
             cur.close()
         if conn:
-            conn.close()
+            put_db_connection(conn)
 
 
 
@@ -1258,7 +1260,7 @@ def get_attendance_summary():
 
     finally:
         cur.close()
-        conn.close()
+        put_db_connection(conn)
 @app.route("/update-profile-name", methods=["POST"])
 def update_profile_name():
     if "user_id" not in session:
@@ -1273,7 +1275,7 @@ def update_profile_name():
     cur.execute("UPDATE users SET name = %s WHERE user_id = %s", (new_name, session["user_id"]))
     conn.commit()
     cur.close()
-    conn.close()
+    put_db_connection(conn)
 
     return jsonify({"message": "Name updated"}), 200
 @app.route("/update-password", methods=["POST"])
@@ -1290,7 +1292,7 @@ def update_password():
     cur.execute("UPDATE users SET password = %s WHERE user_id = %s", (new_password, session["user_id"]))
     conn.commit()
     cur.close()
-    conn.close()
+    put_db_connection(conn)
 
     return jsonify({"message": "Password updated"}), 200
 
