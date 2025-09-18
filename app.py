@@ -137,8 +137,6 @@ def upload_offer_letter():
         filepath = os.path.join(OFFER_LETTER_FOLDER, unique_name)
         file.save(filepath)
         db_path = f"/files/offer_letters/{unique_name}"
-
-        # Update the user's offer_letter_url in the database
         cur.execute(
             "UPDATE users SET offer_letter_url = %s WHERE email = %s",
             (db_path, email)
@@ -412,6 +410,12 @@ def register():
 
 # ---------------------- ATTENDANCE ----------------------
 
+from flask import Flask, request, session, jsonify
+from datetime import datetime, date, timezone
+from db import get_db_connection, put_db_connection
+
+
+
 @app.route("/attendance", methods=["POST"])
 def mark_attendance():
     if "user_id" not in session:
@@ -419,7 +423,9 @@ def mark_attendance():
 
     user_id = session["user_id"]
     action = request.form.get("action")
-    now = datetime.now().time()
+
+    # Use UTC datetime with timezone awareness for consistent storage
+    now = datetime.now(timezone.utc).time()  # Save only time part if DB expects time
     today = date.today()
 
     valid_actions = [
@@ -450,9 +456,6 @@ def mark_attendance():
                 (now, user_id, today)
             )
         else:
-            # Insert a new row with the action
-            # Must provide NULL or default for other columns not specified here
-            # Assuming your DB schema allows NULLs for other columns
             columns = ['user_id', 'date', action]
             values = [user_id, today, now]
             query = f"INSERT INTO attendance ({', '.join(columns)}) VALUES (%s, %s, %s)"
@@ -468,6 +471,7 @@ def mark_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
+
 @app.route("/my-attendance")
 def my_attendance():
     if "user_id" not in session:
@@ -511,7 +515,7 @@ def my_attendance():
                 "lunch_out": row[6].strftime("%H:%M:%S") if row[6] else "",
                 "lunch_in": row[7].strftime("%H:%M:%S") if row[7] else "",
                 "office_out": row[8].strftime("%H:%M:%S") if row[8] else "",
-                "leave_type": row[9] if row[9] else None,   # set 'leave_type' for the frontend
+                "leave_type": row[9] if row[9] else None,
             })
 
         return jsonify(result)
@@ -519,6 +523,7 @@ def my_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
+
 
         
 @app.route("/all-attendance")
