@@ -25,7 +25,11 @@ app = Flask(__name__)
 
 IST = pytz.timezone('Asia/Kolkata')
 OFFICE_IPS = [
-    "171.76.86.12",   
+    "171.76.86.12", 
+    "152.57.97.88",
+    "183.83.164.14",
+    "49.43.216.190",
+    "49.37.155.17",  
     # Add any other office IPs here if you have them
 ]
 def now_ist():
