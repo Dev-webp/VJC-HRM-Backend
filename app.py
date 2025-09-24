@@ -15,7 +15,23 @@ from flask_cors import cross_origin
 from decimal import Decimal
 from psycopg2.extras import RealDictCursor
 from db import get_db_connection, put_db_connection
+from flask import Flask, request, session, jsonify
+from datetime import datetime, date, timezone, timedelta
+from db import get_db_connection, put_db_connection
+import pytz
+from calendar import monthrange
 
+app = Flask(__name__)
+
+IST = pytz.timezone('Asia/Kolkata')
+
+def now_ist():
+    # Returns current time in India with timezone awareness
+    return datetime.now(IST)
+
+def today_ist():
+    # Returns current date in India
+    return now_ist().date()
 # Load environment variables
 def cleanup_orphaned_paid_leave_attendance():
     conn = get_db_connection()
@@ -410,10 +426,6 @@ def register():
 
 # ---------------------- ATTENDANCE ----------------------
 
-from flask import Flask, request, session, jsonify
-from datetime import datetime, date, timezone
-from db import get_db_connection, put_db_connection
-
 
 
 @app.route("/attendance", methods=["POST"])
@@ -424,16 +436,16 @@ def mark_attendance():
     user_id = session["user_id"]
     action = request.form.get("action")
 
-    # Use UTC datetime with timezone awareness for consistent storage
-    now = datetime.now(timezone.utc).time()  # Save only time part if DB expects time
-    today = date.today()
+    # Get Indian time (IST)
+    now = now_ist().time()
+    today = today_ist()
 
     valid_actions = [
         "office_in",
         "break_out",
         "break_in",
-        "break_out_2",  # Added second break out action
-        "break_in_2",   # Added second break in action
+        "break_out_2",
+        "break_in_2",
         "lunch_out",
         "lunch_in",
         "office_out"
@@ -467,7 +479,6 @@ def mark_attendance():
     except Exception as e:
         conn.rollback()
         return {"message": f"❌ DB Error: {str(e)}"}, 500
-    
     finally:
         cur.close()
         put_db_connection(conn)
@@ -504,17 +515,18 @@ def my_attendance():
 
         rows = cur.fetchall()
         result = []
+
         for row in rows:
             result.append({
                 "date": row[0].strftime("%Y-%m-%d") if row[0] else "",
-                "office_in": row[1].strftime("%H:%M:%S") if row[1] else "",
-                "break_out": row[2].strftime("%H:%M:%S") if row[2] else "",
-                "break_in": row[3].strftime("%H:%M:%S") if row[3] else "",
-                "break_out_2": row[4].strftime("%H:%M:%S") if row[4] else "",
-                "break_in_2": row[5].strftime("%H:%M:%S") if row[5] else "",
-                "lunch_out": row[6].strftime("%H:%M:%S") if row[6] else "",
-                "lunch_in": row[7].strftime("%H:%M:%S") if row[7] else "",
-                "office_out": row[8].strftime("%H:%M:%S") if row[8] else "",
+                "office_in": str(row[1]) if row[1] else "",
+                "break_out": str(row[2]) if row[2] else "",
+                "break_in": str(row[3]) if row[3] else "",
+                "break_out_2": str(row[4]) if row[4] else "",
+                "break_in_2": str(row[5]) if row[5] else "",
+                "lunch_out": str(row[6]) if row[6] else "",
+                "lunch_in": str(row[7]) if row[7] else "",
+                "office_out": str(row[8]) if row[8] else "",
                 "leave_type": row[9] if row[9] else None,
             })
 
@@ -524,8 +536,6 @@ def my_attendance():
         cur.close()
         put_db_connection(conn)
 
-
-        
 @app.route("/all-attendance")
 def all_attendance():
     month = request.args.get("month")
@@ -549,7 +559,7 @@ def all_attendance():
         cur.execute(query, (not include_inactive,))
         rows = cur.fetchall()
 
-        year, month_num = datetime.now().year, datetime.now().month
+        year, month_num = now_ist().year, now_ist().month
         if month:
             year, month_num = map(int, month.split('-'))
         total_days = monthrange(year, month_num)[1]
@@ -624,8 +634,6 @@ def all_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
-
-
 # ---------------------- LEAVE MANAGEMENT ----------------------
 
 @app.route("/apply-leave", methods=["POST"])
