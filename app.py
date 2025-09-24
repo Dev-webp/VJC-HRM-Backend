@@ -24,7 +24,10 @@ from calendar import monthrange
 app = Flask(__name__)
 
 IST = pytz.timezone('Asia/Kolkata')
-
+OFFICE_IPS = [
+    "171.76.86.12",   
+    # Add any other office IPs here if you have them
+]
 def now_ist():
     # Returns current time in India with timezone awareness
     return datetime.now(IST)
@@ -123,6 +126,10 @@ def upload_profile_image():
         return jsonify({"message": "Profile image uploaded successfully", "image": db_path}), 200
     except Exception as e:
         return jsonify({"message": f"Error saving image: {str(e)}"}), 500
+@app.route("/allowed-ips", methods=["GET"])
+def get_allowed_ips():
+    """Returns a list of public IP addresses permitted to access the service."""
+    return jsonify({"allowed_ips": OFFICE_IPS})
 
 @app.route("/upload-offer-letter", methods=["POST"])
 def upload_offer_letter():
