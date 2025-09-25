@@ -25,7 +25,7 @@ app = Flask(__name__)
 
 IST = pytz.timezone('Asia/Kolkata')
 OFFICE_IPS = [
-    "171.76.86.12", 
+    "171.76.84.77", 
     "152.57.107.135",
     "183.83.164.14",
     "49.43.216.190",
@@ -1044,20 +1044,38 @@ def get_holidays():
 
     # After retries fail, return empty list so frontend doesn't error.
     return jsonify([])
-
+from flask import request, jsonify, session
+from datetime import datetime
+from decimal import Decimal
+from calendar import monthrange
+from psycopg2.extras import RealDictCursor
+from db import get_db_connection, put_db_connection
 
 @app.route('/save-attendance-summary', methods=['POST'])
 def save_attendance_summary():
     if 'user_id' not in session:
         return jsonify({"message": "Unauthorized"}), 401
+
     data = request.get_json()
     month = data.get('month')
-    summary = data.get('summary')  # includes all the necessary keys
+    summary = data.get('summary', {})
+
+    paid_leaves = summary.get('paidLeaves', 0)
+    grace_absents = summary.get('graceAbsents', 0)
+    total_days = summary.get('totalDays', 0)
+    sundays = summary.get('sundays', 0)
+    full_days = summary.get('fullDays', 0)
+    half_days = summary.get('halfDays', 0)
+    total_working_days = summary.get('totalWorkingDays', 0)
+
+    average_per_day = total_working_days / total_days if total_days > 0 else 0
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
-            INSERT INTO attendance_summaries (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day)
+            INSERT INTO attendance_summaries 
+            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id, month) DO UPDATE SET
                 total_days = EXCLUDED.total_days,
@@ -1070,22 +1088,26 @@ def save_attendance_summary():
                 average_per_day = EXCLUDED.average_per_day,
                 generated_at = NOW()
         """, (
-            session['user_id'], month,
-            summary['totalDays'], summary['sundays'], summary['fullDays'], summary['halfDays'],
-            summary['paidLeaves'], summary['graceAbsents'],  # assuming absent_days = graceAbsents, adjust accordingly
-            summary['totalWorkingDays'], summary['totalWorkingDays'] / summary['totalDays']
+            session['user_id'],
+            month,
+            total_days,
+            sundays,
+            full_days,
+            half_days,
+            paid_leaves,
+            grace_absents,
+            total_working_days,
+            average_per_day
         ))
         conn.commit()
         return jsonify({"message": "Summary saved"}), 200
+    except Exception as e:
+        conn.rollback()
+        print(f"Error saving attendance summary: {e}")
+        return jsonify({"message": "Error saving summary"}), 500
     finally:
         cur.close()
         put_db_connection(conn)
-from flask import request, jsonify, session
-from datetime import datetime
-from decimal import Decimal
-from calendar import monthrange
-from psycopg2.extras import RealDictCursor
-
 
 
 @app.route('/payroll/auto-generate-slip', methods=['POST'])
@@ -1102,13 +1124,11 @@ def auto_generate_payroll():
 
     try:
         if requested_email and session.get("role") == "chairman":
-            # Allow chairman to get payroll for any email
             cur.execute("SELECT user_id, name, salary FROM users WHERE email = %s", (requested_email,))
             user = cur.fetchone()
             if not user:
                 return jsonify({"message": "User not found"}), 404
         else:
-            # Default: current user's payroll
             cur.execute("SELECT user_id, name, salary FROM users WHERE user_id = %s", (session["user_id"],))
             user = cur.fetchone()
             if not user:
