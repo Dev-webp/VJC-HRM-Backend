@@ -911,6 +911,9 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",      # or "None" but Lax is safer for local
     SESSION_COOKIE_SECURE=False          # Must be False to send cookies over HTTP
 )
+from flask import jsonify, session
+import traceback
+import psycopg2  # if using psycopg2 for PostgreSQL
 
 @app.route("/dashboard-data")
 def dashboard_data():
@@ -919,17 +922,32 @@ def dashboard_data():
         if session.get("role") != "chairman":
             return jsonify({"message": "Access denied"}), 403
 
-        conn = get_db_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT u.name, u.email, a.date, a.office_in, a.break_out, a.break_in, a.lunch_out, a.lunch_in, a.office_out ,a.paid_leave_reason
-            FROM attendance a
-            JOIN users u ON u.user_id = a.user_id
-            ORDER BY a.date DESC
-        """)
-        rows = cur.fetchall()
-        cur.close()
-        put_db_connection(conn)
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT u.name, u.email, a.date, a.office_in, a.break_out, a.break_in, a.lunch_out, a.lunch_in, a.office_out, a.paid_leave_reason
+                FROM attendance a
+                JOIN users u ON u.user_id = a.user_id
+                ORDER BY a.date DESC
+            """)
+            rows = cur.fetchall()
+            cur.close()
+            put_db_connection(conn)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_err:
+            print("Database connection lost, reconnecting...", db_err)
+            # Retry after reconnect
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT u.name, u.email, a.date, a.office_in, a.break_out, a.break_in, a.lunch_out, a.lunch_in, a.office_out, a.paid_leave_reason
+                FROM attendance a
+                JOIN users u ON u.user_id = a.user_id
+                ORDER BY a.date DESC
+            """)
+            rows = cur.fetchall()
+            cur.close()
+            put_db_connection(conn)
 
         data = []
         for row in rows:
@@ -952,9 +970,9 @@ def dashboard_data():
         return jsonify(data)
 
     except Exception as e:
-        print("Unhandled error in dashboard_data:", e)
+        print("Unhandled error in dashboard_data:")
+        traceback.print_exc()
         return jsonify({"error": "Internal Server Error"}), 500
-# In app.py
 
 # Paid Holidays Table (ensure in postgres: holidays(date, name, is_paid boolean))
 @app.route("/mark-holiday", methods=["POST"])
