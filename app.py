@@ -20,7 +20,12 @@ from datetime import datetime, date, timezone, timedelta
 from db import get_db_connection, put_db_connection
 import pytz
 from calendar import monthrange
-
+from flask import Flask, request, jsonify, session, send_file
+import psycopg2
+from psycopg2.extras import RealDictCursor
+from decimal import Decimal
+from openpyxl import Workbook
+from io import BytesIO
 app = Flask(__name__)
 
 IST = pytz.timezone('Asia/Kolkata')
@@ -436,8 +441,7 @@ def register():
     return "✅ Registered", 200
 
 # ---------------------- ATTENDANCE ----------------------
-
-
+import json  # Make sure you have this at the top of your file
 
 @app.route("/attendance", methods=["POST"])
 def mark_attendance():
@@ -446,8 +450,8 @@ def mark_attendance():
 
     user_id = session["user_id"]
     action = request.form.get("action")
+    time_param = request.form.get("time")  # New param to send break timestamp
 
-    # Get Indian time (IST)
     now = now_ist().time()
     today = today_ist()
 
@@ -459,7 +463,9 @@ def mark_attendance():
         "break_in_2",
         "lunch_out",
         "lunch_in",
-        "office_out"
+        "office_out",
+        "extra_break_in",
+        "extra_break_out"
     ]
 
     if action not in valid_actions:
@@ -469,23 +475,70 @@ def mark_attendance():
     cur = conn.cursor()
 
     try:
-        # Check if attendance row exists for today
-        cur.execute("SELECT * FROM attendance WHERE user_id = %s AND date = %s", (user_id, today))
+        cur.execute("SELECT extra_break_ins, extra_break_outs FROM attendance WHERE user_id = %s AND date = %s", (user_id, today))
         row = cur.fetchone()
 
-        if row:
-            cur.execute(
-                f"UPDATE attendance SET {action} = %s WHERE user_id = %s AND date = %s",
-                (now, user_id, today)
-            )
-        else:
-            columns = ['user_id', 'date', action]
-            values = [user_id, today, now]
-            query = f"INSERT INTO attendance ({', '.join(columns)}) VALUES (%s, %s, %s)"
-            cur.execute(query, tuple(values))
+        if action in ["extra_break_in", "extra_break_out"]:
+            if not time_param:
+                return {"message": "Missing time parameter for extra break"}, 400
 
-        conn.commit()
-        return {"message": f"{action} recorded"}, 200
+            time_val = time_param  # expect HH:mm:ss string from frontend
+
+            if row:
+                # row[0] and row[1] are JSONB, so load as Python lists (jsonb => Python list)
+                extra_break_ins = row[0] if row[0] else []
+                extra_break_outs = row[1] if row[1] else []
+
+                # Ensure they're Python lists (Postgres returns as list in psycopg3, but sometimes as string in psycopg2)
+                if isinstance(extra_break_ins, str):
+                    extra_break_ins = json.loads(extra_break_ins)
+                if isinstance(extra_break_outs, str):
+                    extra_break_outs = json.loads(extra_break_outs)
+
+                if action == "extra_break_in":
+                    extra_break_ins.append(time_val)
+                else:
+                    extra_break_outs.append(time_val)
+
+                # Save using json.dumps and ::jsonb!
+                cur.execute("""
+                    UPDATE attendance
+                    SET extra_break_ins = %s::jsonb, extra_break_outs = %s::jsonb
+                    WHERE user_id = %s AND date = %s
+                """, (
+                    json.dumps(extra_break_ins),
+                    json.dumps(extra_break_outs),
+                    user_id, today
+                ))
+            else:
+                extra_break_ins = [time_val] if action == "extra_break_in" else []
+                extra_break_outs = [time_val] if action == "extra_break_out" else []
+                cur.execute("""
+                    INSERT INTO attendance (user_id, date, extra_break_ins, extra_break_outs)
+                    VALUES (%s, %s, %s::jsonb, %s::jsonb)
+                """, (
+                    user_id, today,
+                    json.dumps(extra_break_ins),
+                    json.dumps(extra_break_outs)
+                ))
+
+            conn.commit()
+            return {"message": f"{action} recorded: {time_val}"}, 200
+
+        else:
+            if row:
+                cur.execute(
+                    f"UPDATE attendance SET {action} = %s WHERE user_id = %s AND date = %s",
+                    (now, user_id, today)
+                )
+            else:
+                columns = ['user_id', 'date', action]
+                values = [user_id, today, now]
+                query = f"INSERT INTO attendance ({', '.join(columns)}) VALUES (%s, %s, %s)"
+                cur.execute(query, tuple(values))
+
+            conn.commit()
+            return {"message": f"{action} recorded"}, 200
 
     except Exception as e:
         conn.rollback()
@@ -493,6 +546,8 @@ def mark_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
+
+import json
 
 @app.route("/my-attendance")
 def my_attendance():
@@ -508,7 +563,8 @@ def my_attendance():
 
     try:
         base_query = """
-            SELECT date, office_in, break_out, break_in, break_out_2, break_in_2, lunch_out, lunch_in, office_out, paid_leave_reason
+            SELECT date, office_in, break_out, break_in, break_out_2, break_in_2, lunch_out, lunch_in, office_out, paid_leave_reason,
+                   extra_break_ins, extra_break_outs
             FROM attendance
             WHERE user_id = %s
         """
@@ -528,6 +584,24 @@ def my_attendance():
         result = []
 
         for row in rows:
+            # row[10] and row[11] (extra_break_ins/outs) might be list or JSON string
+            extra_break_ins = row[10]
+            extra_break_outs = row[11]
+            if isinstance(extra_break_ins, str):
+                try:
+                    extra_break_ins = json.loads(extra_break_ins)
+                except Exception:
+                    extra_break_ins = []
+            if extra_break_ins is None:
+                extra_break_ins = []
+            if isinstance(extra_break_outs, str):
+                try:
+                    extra_break_outs = json.loads(extra_break_outs)
+                except Exception:
+                    extra_break_outs = []
+            if extra_break_outs is None:
+                extra_break_outs = []
+
             result.append({
                 "date": row[0].strftime("%Y-%m-%d") if row[0] else "",
                 "office_in": str(row[1]) if row[1] else "",
@@ -539,6 +613,8 @@ def my_attendance():
                 "lunch_in": str(row[7]) if row[7] else "",
                 "office_out": str(row[8]) if row[8] else "",
                 "leave_type": row[9] if row[9] else None,
+                "extra_break_ins": extra_break_ins,
+                "extra_break_outs": extra_break_outs,
             })
 
         return jsonify(result)
@@ -546,6 +622,9 @@ def my_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
+import json
+from datetime import date
+from calendar import monthrange
 
 @app.route("/all-attendance")
 def all_attendance():
@@ -561,7 +640,8 @@ def all_attendance():
                 u.salary, u.location, u.employee_id, u.image,
                 u.bank_account, u.dob, u.doj, u.pan_no, u.ifsc_code, u.department,
                 a.date, a.office_in, a.break_out, a.break_in,
-                a.break_out_2, a.break_in_2, a.lunch_out, a.lunch_in, a.office_out, a.paid_leave_reason
+                a.break_out_2, a.break_in_2, a.lunch_out, a.lunch_in, a.office_out, a.paid_leave_reason,
+                a.extra_break_ins, a.extra_break_outs
             FROM users u
             LEFT JOIN attendance a ON a.user_id = u.user_id
             WHERE u.is_active = %s
@@ -570,7 +650,8 @@ def all_attendance():
         cur.execute(query, (not include_inactive,))
         rows = cur.fetchall()
 
-        year, month_num = now_ist().year, now_ist().month
+        now_dt = now_ist()
+        year, month_num = now_dt.year, now_dt.month
         if month:
             year, month_num = map(int, month.split('-'))
         total_days = monthrange(year, month_num)[1]
@@ -583,8 +664,25 @@ def all_attendance():
                 salary, location, employee_id, image,
                 bank_account, dob, doj, pan_no, ifsc_code, department,
                 attend_date, office_in, break_out, break_in,
-                break_out_2, break_in_2, lunch_out, lunch_in, office_out, paid_leave_reason
+                break_out_2, break_in_2, lunch_out, lunch_in, office_out, paid_leave_reason,
+                extra_break_ins, extra_break_outs
             ) = r
+
+            # Ensure extra_break_ins and extra_break_outs are always lists
+            if isinstance(extra_break_ins, str):
+                try:
+                    extra_break_ins = json.loads(extra_break_ins)
+                except Exception:
+                    extra_break_ins = []
+            if extra_break_ins is None:
+                extra_break_ins = []
+            if isinstance(extra_break_outs, str):
+                try:
+                    extra_break_outs = json.loads(extra_break_outs)
+                except Exception:
+                    extra_break_outs = []
+            if extra_break_outs is None:
+                extra_break_outs = []
 
             if email not in users:
                 users[email] = {
@@ -615,10 +713,12 @@ def all_attendance():
                     "break_in_2": break_in_2.isoformat() if break_in_2 else None,
                     "lunch_out": lunch_out.isoformat() if lunch_out else None,
                     "lunch_in": lunch_in.isoformat() if lunch_in else None,
-                    "paid_leave_reason": paid_leave_reason
+                    "paid_leave_reason": paid_leave_reason,
+                    "extra_break_ins": extra_break_ins,
+                    "extra_break_outs": extra_break_outs,
                 })
 
-        # Fill missing dates for attendance as before
+        # Fill missing dates for attendance
         for user in users.values():
             existing_dates = {rec["date"] for rec in user["attendance"]}
             for d in all_dates:
@@ -635,6 +735,8 @@ def all_attendance():
                         "lunch_out": None,
                         "lunch_in": None,
                         "paid_leave_reason": None,
+                        "extra_break_ins": [],
+                        "extra_break_outs": [],
                         "reason": "Sunday" if d.weekday() == 6 else None,
                         "present": True if d.weekday() == 6 else False
                     })
@@ -642,45 +744,6 @@ def all_attendance():
 
         return jsonify(users)
 
-    finally:
-        cur.close()
-        put_db_connection(conn)
-# ---------------------- LEAVE MANAGEMENT ----------------------
-
-@app.route("/apply-leave", methods=["POST"])
-def apply_leave():
-    
-    data = request.get_json()
-    user_id = session["user_id"]
-    leave_type = data.get("leave_type")
-    start_date = data.get("start_date")
-    end_date = data.get("end_date")
-    reason = data.get("reason")
-
-    if not all([leave_type, start_date, end_date, reason]):
-        return jsonify({"message": "Missing required fields"}), 400
-
-    try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
-        if start_dt > end_dt:
-            return jsonify({"message": "Start date cannot be after end date"}), 400
-    except:
-        return jsonify({"message": "Invalid date format"}), 400
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        # Insert leave request with status "Pending"
-        cur.execute("""
-            INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, reason, status)
-            VALUES (%s, %s, %s, %s, %s, 'Pending')
-        """, (user_id, leave_type, start_dt, end_dt, reason))
-        conn.commit()
-        return jsonify({"message": "Leave request submitted"}), 200
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"message": f"DB Error: {str(e)}"}), 500
     finally:
         cur.close()
         put_db_connection(conn)
@@ -911,68 +974,6 @@ app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",      # or "None" but Lax is safer for local
     SESSION_COOKIE_SECURE=False          # Must be False to send cookies over HTTP
 )
-from flask import jsonify, session
-import traceback
-import psycopg2  # if using psycopg2 for PostgreSQL
-
-@app.route("/dashboard-data")
-def dashboard_data():
-    try:
-        print("Session contents:", dict(session))
-        if session.get("role") != "chairman":
-            return jsonify({"message": "Access denied"}), 403
-
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT u.name, u.email, a.date, a.office_in, a.break_out, a.break_in, a.lunch_out, a.lunch_in, a.office_out, a.paid_leave_reason
-                FROM attendance a
-                JOIN users u ON u.user_id = a.user_id
-                ORDER BY a.date DESC
-            """)
-            rows = cur.fetchall()
-            cur.close()
-            put_db_connection(conn)
-        except (psycopg2.OperationalError, psycopg2.InterfaceError) as db_err:
-            print("Database connection lost, reconnecting...", db_err)
-            # Retry after reconnect
-            conn = get_db_connection()
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT u.name, u.email, a.date, a.office_in, a.break_out, a.break_in, a.lunch_out, a.lunch_in, a.office_out, a.paid_leave_reason
-                FROM attendance a
-                JOIN users u ON u.user_id = a.user_id
-                ORDER BY a.date DESC
-            """)
-            rows = cur.fetchall()
-            cur.close()
-            put_db_connection(conn)
-
-        data = []
-        for row in rows:
-            try:
-                data.append({
-                    "name": row[0],
-                    "email": row[1],
-                    "date": row[2].strftime("%Y-%m-%d") if row[2] else "",
-                    "office_in": str(row[3]) if row[3] else "",
-                    "break_out": str(row[4]) if row[4] else "",
-                    "break_in": str(row[5]) if row[5] else "",
-                    "lunch_out": str(row[6]) if row[6] else "",
-                    "lunch_in": str(row[7]) if row[7] else "",
-                    "office_out": str(row[8]) if row[8] else "",
-                    "leave_type": row[9] if row[9] else None,
-                })
-            except Exception as row_err:
-                print("Row formatting error:", row_err)
-
-        return jsonify(data)
-
-    except Exception as e:
-        print("Unhandled error in dashboard_data:")
-        traceback.print_exc()
-        return jsonify({"error": "Internal Server Error"}), 500
 
 # Paid Holidays Table (ensure in postgres: holidays(date, name, is_paid boolean))
 @app.route("/mark-holiday", methods=["POST"])
@@ -1068,7 +1069,6 @@ from decimal import Decimal
 from calendar import monthrange
 from psycopg2.extras import RealDictCursor
 from db import get_db_connection, put_db_connection
-
 @app.route('/save-attendance-summary', methods=['POST'])
 def save_attendance_summary():
     if 'user_id' not in session:
@@ -1077,6 +1077,7 @@ def save_attendance_summary():
     data = request.get_json()
     month = data.get('month')
     summary = data.get('summary', {})
+    net_payable = summary.get('netPayable', 0)  # <- add this line
 
     paid_leaves = summary.get('paidLeaves', 0)
     grace_absents = summary.get('graceAbsents', 0)
@@ -1085,7 +1086,6 @@ def save_attendance_summary():
     full_days = summary.get('fullDays', 0)
     half_days = summary.get('halfDays', 0)
     total_working_days = summary.get('totalWorkingDays', 0)
-
     average_per_day = total_working_days / total_days if total_days > 0 else 0
 
     conn = get_db_connection()
@@ -1093,8 +1093,8 @@ def save_attendance_summary():
     try:
         cur.execute("""
             INSERT INTO attendance_summaries 
-            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day, net_payable)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id, month) DO UPDATE SET
                 total_days = EXCLUDED.total_days,
                 sundays = EXCLUDED.sundays,
@@ -1104,6 +1104,7 @@ def save_attendance_summary():
                 absent_days = EXCLUDED.absent_days,
                 work_days = EXCLUDED.work_days,
                 average_per_day = EXCLUDED.average_per_day,
+                net_payable = EXCLUDED.net_payable,
                 generated_at = NOW()
         """, (
             session['user_id'],
@@ -1115,7 +1116,8 @@ def save_attendance_summary():
             paid_leaves,
             grace_absents,
             total_working_days,
-            average_per_day
+            average_per_day,
+            net_payable
         ))
         conn.commit()
         return jsonify({"message": "Summary saved"}), 200
@@ -1126,7 +1128,6 @@ def save_attendance_summary():
     finally:
         cur.close()
         put_db_connection(conn)
-
 
 @app.route('/payroll/auto-generate-slip', methods=['POST'])
 def auto_generate_payroll():
@@ -1298,7 +1299,6 @@ def update_user(email):
            conn.close()
 
 
-
 @app.route('/get-attendance-summary', methods=['POST'])
 def get_attendance_summary():
     if 'user_id' not in session:
@@ -1322,7 +1322,7 @@ def get_attendance_summary():
 
         cur.execute("""
             SELECT total_days, sundays, full_days, half_days,
-                   paid_leaves, absent_days, work_days, average_per_day, generated_at
+                paid_leaves, absent_days, work_days, average_per_day, generated_at
             FROM attendance_summaries
             WHERE user_id = %s AND month = %s
             LIMIT 1
@@ -1333,7 +1333,6 @@ def get_attendance_summary():
 
         work_days_val = summary[6]
         average_per_day_val = summary[7]
-
         work_days = float(work_days_val) if isinstance(work_days_val, Decimal) else work_days_val
         average_per_day = float(average_per_day_val) if isinstance(average_per_day_val, Decimal) else average_per_day_val
 
@@ -1353,6 +1352,54 @@ def get_attendance_summary():
     finally:
         cur.close()
         put_db_connection(conn)
+
+@app.route('/export-all-attendance-summary', methods=['GET'])
+def export_all_attendance_summary():
+    if 'user_id' not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    month = request.args.get('month')
+    if not month:
+        return jsonify({"message": "Missing month"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Join users and attendance_summaries for the designated month
+        cur.execute("""
+            SELECT u.email, u.name, u.role,
+                   s.total_days, s.sundays, s.full_days, s.half_days,
+                   s.paid_leaves, s.absent_days, s.work_days, s.average_per_day, s.generated_at
+            FROM users u
+            LEFT JOIN attendance_summaries s ON u.user_id = s.user_id AND s.month = %s
+            ORDER BY u.email
+        """, (month,))
+        rows = cur.fetchall()
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = f"Summary {month}"
+        ws.append([
+            "Email", "Name", "Role", "Total Days", "Sundays", "Full Days",
+            "Half Days", "Paid Leaves", "Absent Days", "Work Days", "Avg/Day", "Generated At"
+        ])
+        for row in rows:
+            ws.append([
+                row['email'], row['name'], row['role'],
+                row.get('total_days', 0), row.get('sundays', 0), row.get('full_days', 0),
+                row.get('half_days', 0), row.get('paid_leaves', 0), row.get('absent_days', 0),
+                float(row['work_days']) if row['work_days'] is not None else 0,
+                float(row['average_per_day']) if row['average_per_day'] is not None else 0,
+                str(row['generated_at']) if row['generated_at'] else ""
+            ])
+        bio = BytesIO()
+        wb.save(bio)
+        bio.seek(0)
+        filename = f"attendance_summary_{month}.xlsx"
+        return send_file(bio, as_attachment=True, download_name=filename, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
 @app.route("/update-profile-name", methods=["POST"])
 def update_profile_name():
     if "user_id" not in session:
