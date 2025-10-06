@@ -747,7 +747,43 @@ def all_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
+@app.route("/apply-leave", methods=["POST"])
+def apply_leave():
+    
+    data = request.get_json()
+    user_id = session["user_id"]
+    leave_type = data.get("leave_type")
+    start_date = data.get("start_date")
+    end_date = data.get("end_date")
+    reason = data.get("reason")
 
+    if not all([leave_type, start_date, end_date, reason]):
+        return jsonify({"message": "Missing required fields"}), 400
+
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+        if start_dt > end_dt:
+            return jsonify({"message": "Start date cannot be after end date"}), 400
+    except:
+        return jsonify({"message": "Invalid date format"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Insert leave request with status "Pending"
+        cur.execute("""
+            INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, reason, status)
+            VALUES (%s, %s, %s, %s, %s, 'Pending')
+        """, (user_id, leave_type, start_dt, end_dt, reason))
+        conn.commit()
+        return jsonify({"message": "Leave request submitted"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": f"DB Error: {str(e)}"}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
 @app.route("/my-leave-requests")
 def my_leave_requests():
     if "user_id" not in session:
