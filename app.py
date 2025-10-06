@@ -1099,22 +1099,45 @@ def get_holidays():
 
     # After retries fail, return empty list so frontend doesn't error.
     return jsonify([])
+@app.route("/holidays-count")
+def holidays_count():
+    month = request.args.get("month")  # "YYYY-MM"
+    if not month or len(month) != 7:
+        return jsonify({"count": 0})
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT COUNT(*) FROM holidays WHERE TO_CHAR(date, 'YYYY-MM') = %s", (month,))
+    count = cur.fetchone()[0]
+    cur.close()
+    put_db_connection(conn)
+    return jsonify({"count": count})
+
 from flask import request, jsonify, session
 from datetime import datetime
 from decimal import Decimal
 from calendar import monthrange
 from psycopg2.extras import RealDictCursor
 from db import get_db_connection, put_db_connection
-
 @app.route('/save-attendance-summary', methods=['POST'])
 def save_attendance_summary():
+    # 1. Check Authorization
     if 'user_id' not in session:
         return jsonify({"message": "Unauthorized"}), 401
 
     data = request.get_json()
     month = data.get('month')
     summary = data.get('summary', {})
+    
+    # Extract Net Payable, checking the top level first (as sent by the dedicated netpay frontend call)
+    # The frontend code was sending: { month, employeeId, net_payable }
+    # So we check the top level 'net_payable' first.
+    net_payable = data.get('net_payable') 
+    
+    # If not found at the top level, check the 'summary' dictionary (just in case)
+    if net_payable is None:
+        net_payable = summary.get('net_payable')
 
+    # Extract other summary fields
     paid_leaves = summary.get('paidLeaves', 0)
     grace_absents = summary.get('graceAbsents', 0)
     total_days = summary.get('totalDays', 0)
@@ -1130,8 +1153,8 @@ def save_attendance_summary():
     try:
         cur.execute("""
             INSERT INTO attendance_summaries 
-            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day, net_payable)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id, month) DO UPDATE SET
                 total_days = EXCLUDED.total_days,
                 sundays = EXCLUDED.sundays,
@@ -1141,6 +1164,7 @@ def save_attendance_summary():
                 absent_days = EXCLUDED.absent_days,
                 work_days = EXCLUDED.work_days,
                 average_per_day = EXCLUDED.average_per_day,
+                net_payable = EXCLUDED.net_payable,  -- ADDED
                 generated_at = NOW()
         """, (
             session['user_id'],
@@ -1152,10 +1176,11 @@ def save_attendance_summary():
             paid_leaves,
             grace_absents,
             total_working_days,
-            average_per_day
+            average_per_day,
+            net_payable # ADDED
         ))
         conn.commit()
-        return jsonify({"message": "Summary saved"}), 200
+        return jsonify({"message": "Summary and Net Payable saved"}), 200
     except Exception as e:
         conn.rollback()
         print(f"Error saving attendance summary: {e}")
