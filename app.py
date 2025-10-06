@@ -1069,6 +1069,7 @@ from decimal import Decimal
 from calendar import monthrange
 from psycopg2.extras import RealDictCursor
 from db import get_db_connection, put_db_connection
+
 @app.route('/save-attendance-summary', methods=['POST'])
 def save_attendance_summary():
     if 'user_id' not in session:
@@ -1077,7 +1078,6 @@ def save_attendance_summary():
     data = request.get_json()
     month = data.get('month')
     summary = data.get('summary', {})
-    net_payable = summary.get('netPayable', 0)  # <- add this line
 
     paid_leaves = summary.get('paidLeaves', 0)
     grace_absents = summary.get('graceAbsents', 0)
@@ -1086,6 +1086,7 @@ def save_attendance_summary():
     full_days = summary.get('fullDays', 0)
     half_days = summary.get('halfDays', 0)
     total_working_days = summary.get('totalWorkingDays', 0)
+
     average_per_day = total_working_days / total_days if total_days > 0 else 0
 
     conn = get_db_connection()
@@ -1093,8 +1094,8 @@ def save_attendance_summary():
     try:
         cur.execute("""
             INSERT INTO attendance_summaries 
-            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day, net_payable)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id, month) DO UPDATE SET
                 total_days = EXCLUDED.total_days,
                 sundays = EXCLUDED.sundays,
@@ -1104,7 +1105,6 @@ def save_attendance_summary():
                 absent_days = EXCLUDED.absent_days,
                 work_days = EXCLUDED.work_days,
                 average_per_day = EXCLUDED.average_per_day,
-                net_payable = EXCLUDED.net_payable,
                 generated_at = NOW()
         """, (
             session['user_id'],
@@ -1116,8 +1116,7 @@ def save_attendance_summary():
             paid_leaves,
             grace_absents,
             total_working_days,
-            average_per_day,
-            net_payable
+            average_per_day
         ))
         conn.commit()
         return jsonify({"message": "Summary saved"}), 200
@@ -1128,6 +1127,7 @@ def save_attendance_summary():
     finally:
         cur.close()
         put_db_connection(conn)
+
 
 @app.route('/payroll/auto-generate-slip', methods=['POST'])
 def auto_generate_payroll():
