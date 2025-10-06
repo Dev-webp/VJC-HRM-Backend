@@ -1153,7 +1153,7 @@ def save_attendance_summary():
     try:
         cur.execute("""
             INSERT INTO attendance_summaries 
-            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day, net_payable)
+            (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id, month) DO UPDATE SET
                 total_days = EXCLUDED.total_days,
@@ -1164,7 +1164,7 @@ def save_attendance_summary():
                 absent_days = EXCLUDED.absent_days,
                 work_days = EXCLUDED.work_days,
                 average_per_day = EXCLUDED.average_per_day,
-                net_payable = EXCLUDED.net_payable,  -- ADDED
+             
                 generated_at = NOW()
         """, (
             session['user_id'],
@@ -1177,7 +1177,7 @@ def save_attendance_summary():
             grace_absents,
             total_working_days,
             average_per_day,
-            net_payable # ADDED
+           
         ))
         conn.commit()
         return jsonify({"message": "Summary and Net Payable saved"}), 200
