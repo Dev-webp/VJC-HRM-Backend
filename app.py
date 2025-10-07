@@ -1146,7 +1146,7 @@ def save_attendance_summary():
         cur.execute("""
             INSERT INTO attendance_summaries 
             (user_id, month, total_days, sundays, full_days, half_days, paid_leaves, absent_days, work_days, average_per_day)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (user_id, month) DO UPDATE SET
                 total_days = EXCLUDED.total_days,
                 sundays = EXCLUDED.sundays,
