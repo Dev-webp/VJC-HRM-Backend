@@ -139,10 +139,9 @@ def upload_profile_image():
 def get_allowed_ips():
     """Returns a list of public IP addresses permitted to access the service."""
     return jsonify({"allowed_ips": OFFICE_IPS})
-
 @app.route("/upload-offer-letter", methods=["POST"])
 def upload_offer_letter():
-    if "user_id" not in session or session.get("role") != "chairman":
+    if "user_id" not in session or session.get("role") not in ("chairman", "manager"):
         return jsonify({"message": "Access denied"}), 403
 
     email = request.form.get("email")
@@ -181,11 +180,12 @@ def upload_offer_letter():
         if conn:
             conn.rollback()
         return jsonify({"message": f"Error saving file: {str(e)}"}), 500
+
     finally:
         if cur:
             cur.close()
         if conn:
-            put_db_connection(conn)
+            conn.close()
 
 # The existing route to serve the files remains the same.
 @app.route("/files/offer_letters/<path:filename>")
@@ -814,13 +814,11 @@ def my_leave_requests():
 
 @app.route("/all-leave-requests")
 def all_leave_requests():
-   
-
     conn = get_db_connection()
     cur = conn.cursor()
     try:
         cur.execute("""
-            SELECT lr.id, u.user_id, u.name, u.email,
+            SELECT lr.id, u.user_id, u.name, u.email, u.location,
                    lr.leave_type, lr.start_date, lr.end_date,
                    lr.reason, lr.status, lr.chairman_remarks
             FROM leave_requests lr
@@ -835,12 +833,13 @@ def all_leave_requests():
                 "employee_id": r[1],
                 "employee_name": r[2],
                 "employee_email": r[3],
-                "leave_type": r[4],
-                "start_date": r[5].strftime("%Y-%m-%d") if r[5] else None,
-                "end_date": r[6].strftime("%Y-%m-%d") if r[6] else None,
-                "reason": r[7] or "",
-                "status": r[8],
-                "chairman_remarks": r[9] or "",
+                "location": r[4],  # Add location here
+                "leave_type": r[5],
+                "start_date": r[6].strftime("%Y-%m-%d") if r[6] else None,
+                "end_date": r[7].strftime("%Y-%m-%d") if r[7] else None,
+                "reason": r[8] or "",
+                "status": r[9],
+                "chairman_remarks": r[10] or "",
             })
         return jsonify(result)
     finally:
@@ -926,7 +925,7 @@ def leave_action():
 # ---------------------- CHAIRMAN DASHBOARD ----------------------
 @app.route("/create-user", methods=["POST"])
 def create_user():
-    if session.get("role") != "chairman":
+    if session.get("role") not in ("chairman", "manager"):
         return jsonify({"message": "Access denied"}), 403
 
     data = request.get_json()
@@ -1280,14 +1279,16 @@ from flask import request, jsonify, session
 def update_user(email):
     email = unquote(email)  # Decode URL encoded email
     
-    # Only chairman can update user details
-    if session.get("role") != "chairman":
+    role = session.get("role")
+    if role not in ("chairman", "manager"):
         return jsonify({"message": "Access denied"}), 403
-    
+
+    # If user is manager, restrict updates only to users with same location
+
     data = request.get_json()
     if not data:
         return jsonify({"message": "No input data provided"}), 400
-    
+
     allowed_fields = [
         "name",
         "role",
@@ -1310,7 +1311,6 @@ def update_user(email):
     for field in allowed_fields:
         if field in data:
             value = data[field]
-            # Convert empty string for dates to None
             if field in ("dob", "doj") and value == "":
                 value = None
 
@@ -1349,8 +1349,7 @@ def update_user(email):
         if cur:
             cur.close()
         if conn:
-           conn.close()
-
+            conn.close()
 
 @app.route('/get-attendance-summary', methods=['POST'])
 def get_attendance_summary():
@@ -1487,7 +1486,59 @@ def update_password():
     put_db_connection(conn)
 
     return jsonify({"message": "Password updated"}), 200
+from flask import request, jsonify
+# Assuming 'app', 'get_db_connection', 'put_db_connection' are available
 
+@app.route("/assign-manager-role", methods=["POST"])
+def assign_manager_role():
+    """
+    Allows the Chairman to assign an 'employee' the 'manager' role 
+    and set their designated 'location'.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        data = request.get_json()
+        employee_email = data.get("email")
+        # Change: Expect 'location' instead of 'branch'
+        location = data.get("location") 
+
+        if not employee_email or not location:
+            return jsonify({"error": "Missing email or location in request body."}), 400
+
+        # 2. Database Update
+        # *** CRITICAL FIX: Update the 'location' column now ***
+        cur.execute("""
+            UPDATE users
+            SET role = %s, location = %s
+            WHERE email = %s
+        """, ('manager', location, employee_email))
+
+        conn.commit()
+
+        # 3. Validation Check
+        if cur.rowcount == 0:
+            return jsonify({"error": f"No user found with email: {employee_email} to update."}), 404
+        
+        return jsonify({
+            # Change: Message reflects 'location'
+            "message": f"Successfully assigned 'manager' role and '{location}' location to {employee_email}."
+        }), 200
+
+    except Exception as e:
+        # Check if the error is the missing column error
+        if 'column "location" of relation "users" does not exist' in str(e) or 'column "branch" of relation "users" does not exist' in str(e):
+             print("\n\n!! CRITICAL DATABASE ERROR: The 'location' column is missing from the 'users' table. !!")
+             print("!! FIX: Run 'ALTER TABLE users ADD COLUMN location TEXT;' on your database. !!\n")
+        
+        conn.rollback()
+        print(f"Error during manager assignment: {e}")
+        return jsonify({"error": "An internal database error occurred."}), 500
+        
+    finally:
+        cur.close()
+        put_db_connection(conn)
 
         
 # Get approved leaves of type 'Earned' for a particular employee
