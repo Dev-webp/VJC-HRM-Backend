@@ -625,25 +625,39 @@ def my_attendance():
         put_db_connection(conn)
 from flask import request, jsonify, session
 import json
+from flask import request, jsonify, session
+import json
 
 @app.route("/edit-attendance/<email>", methods=["PUT", "OPTIONS"])
 def edit_attendance(email):
-    allowed_origin = "http://localhost:3000"  # Set to your frontend domain in production
+    # Dynamically get origin from request headers
+    origin = request.headers.get("Origin")
 
-    # CORS preflight
+    # Allow localhost and your VPS domain
+    allowed_origins = ["http://localhost:3000", "https://hrm.vjcoverseas.com"]
+
+    # Set allowed origin only if in allowed list, else no CORS
+    if origin in allowed_origins:
+        allowed_origin = origin
+    else:
+        allowed_origin = None
+
+    # Handle CORS preflight request
     if request.method == "OPTIONS":
         resp = jsonify({"ok": True})
-        resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
-        resp.headers.add("Access-Control-Allow-Credentials", "true")
-        resp.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
-        resp.headers.add("Access-Control-Allow-Methods", "PUT,OPTIONS")
+        if allowed_origin:
+            resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
+            resp.headers.add("Access-Control-Allow-Credentials", "true")
+            resp.headers.add("Access-Control-Allow-Headers", "Content-Type,Authorization")
+            resp.headers.add("Access-Control-Allow-Methods", "PUT,OPTIONS")
         return resp, 200
 
-    # Auth check
+    # Authentication check
     if "user_id" not in session or session.get("role") not in ("chairman", "front-desk", "manager"):
         resp = jsonify({"success": False, "error": "Not authorized"})
-        resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
-        resp.headers.add("Access-Control-Allow-Credentials", "true")
+        if allowed_origin:
+            resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
+            resp.headers.add("Access-Control-Allow-Credentials", "true")
         return resp, 403
 
     conn = get_db_connection()
@@ -653,21 +667,22 @@ def edit_attendance(email):
         logs = data.get("logs", [])
         if not isinstance(logs, list):
             resp = jsonify({"success": False, "error": "Invalid logs format"})
-            resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
-            resp.headers.add("Access-Control-Allow-Credentials", "true")
+            if allowed_origin:
+                resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
+                resp.headers.add("Access-Control-Allow-Credentials", "true")
             return resp, 400
 
         cur.execute("SELECT user_id FROM users WHERE email = %s", (email,))
         res = cur.fetchone()
         if not res:
             resp = jsonify({"success": False, "error": "User not found"})
-            resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
-            resp.headers.add("Access-Control-Allow-Credentials", "true")
+            if allowed_origin:
+                resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
+                resp.headers.add("Access-Control-Allow-Credentials", "true")
             return resp, 404
         user_id = res[0]
 
         for log in logs:
-            # Defensive parse
             date = log.get("date")
             if not date:
                 continue
@@ -683,7 +698,6 @@ def edit_attendance(email):
             extra_break_ins_json = json.dumps(log.get("extra_break_ins", []))
             extra_break_outs_json = json.dumps(log.get("extra_break_outs", []))
 
-            # Try update first
             cur.execute("""
                 UPDATE attendance SET
                     office_in=%s, break_in=%s, break_out=%s, break_in_2=%s, break_out_2=%s,
@@ -698,7 +712,6 @@ def edit_attendance(email):
             ))
 
             if cur.rowcount == 0:
-                # Insert new if no update
                 cur.execute("""
                     INSERT INTO attendance (
                         user_id, date, office_in, break_in, break_out,
@@ -711,11 +724,11 @@ def edit_attendance(email):
                     lunch_in, lunch_out, office_out, paid_leave_reason,
                     extra_break_ins_json, extra_break_outs_json
                 ))
-
         conn.commit()
         resp = jsonify({"success": True, "message": "Attendance logs updated."})
-        resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
-        resp.headers.add("Access-Control-Allow-Credentials", "true")
+        if allowed_origin:
+            resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
+            resp.headers.add("Access-Control-Allow-Credentials", "true")
         return resp, 200
 
     except Exception as e:
@@ -723,8 +736,9 @@ def edit_attendance(email):
         traceback.print_exc()
         conn.rollback()
         resp = jsonify({"success": False, "error": str(e)})
-        resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
-        resp.headers.add("Access-Control-Allow-Credentials", "true")
+        if allowed_origin:
+            resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
+            resp.headers.add("Access-Control-Allow-Credentials", "true")
         return resp, 500
 
     finally:
