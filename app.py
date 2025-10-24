@@ -1134,11 +1134,11 @@ app.config.update(
     SESSION_COOKIE_SECURE=False          # Must be False to send cookies over HTTP
 )
 
-# Paid Holidays Table (ensure in postgres: holidays(date, name, is_paid boolean))
 @app.route("/mark-holiday", methods=["POST"])
 def mark_holiday():
     if session.get("role") != "chairman":
         return jsonify({"message": "Unauthorized"}), 403
+
     data = request.get_json()
     date = data.get("date")
     name = data.get("name")
@@ -1146,13 +1146,30 @@ def mark_holiday():
 
     conn = get_db_connection()
     cur = conn.cursor()
+    # ---- OLD CODE: Your holiday insert stays as is
     cur.execute(
         "INSERT INTO holidays (date, name, is_paid) VALUES (%s, %s, %s) ON CONFLICT (date) DO UPDATE SET name = %s, is_paid = %s",
         (date, name, is_paid, name, is_paid))
     conn.commit()
+    # ---- END OLD CODE
+
+    # ---- NEW (ADDITIVE) LOGIC for marking attendance on that date for all active users:
+    cur.execute("SELECT user_id FROM users WHERE is_active = TRUE")
+    for row in cur.fetchall():
+        user_id = row[0]
+        cur.execute("""
+            INSERT INTO attendance (user_id, date, office_in, office_out)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (user_id, date) DO UPDATE
+            SET office_in = EXCLUDED.office_in, office_out = EXCLUDED.office_out
+        """, (user_id, date, '10:00:00', '19:00:00'))
+    conn.commit()
+    # ---- END NEW LOGIC
+
     cur.close()
     put_db_connection(conn)
     return jsonify({"message": "Holiday marked"}), 200
+
 @app.route("/delete-holiday/<date>", methods=["DELETE", "OPTIONS"])
 @cross_origin(supports_credentials=True)
 def delete_holiday(date):
