@@ -627,6 +627,10 @@ from flask import request, jsonify, session
 import json
 from flask import request, jsonify, session
 import json
+import json
+from flask import request, jsonify, session
+# Assuming get_db_connection and put_db_connection are defined elsewhere
+# from .db_utils import get_db_connection, put_db_connection 
 
 @app.route("/edit-attendance/<email>", methods=["PUT", "OPTIONS"])
 def edit_attendance(email):
@@ -660,6 +664,9 @@ def edit_attendance(email):
             resp.headers.add("Access-Control-Allow-Credentials", "true")
         return resp, 403
 
+    # Get the ID of the user performing the edit
+    editor_id = session.get("user_id")
+
     conn = get_db_connection()
     cur = conn.cursor()
     try:
@@ -681,37 +688,142 @@ def edit_attendance(email):
                 resp.headers.add("Access-Control-Allow-Credentials", "true")
             return resp, 404
         user_id = res[0]
+        
+        updated_log_count = 0
 
         for log in logs:
             date = log.get("date")
             if not date:
                 continue
-            office_in = log.get("office_in") or None
-            break_in = log.get("break_in") or None
-            break_out = log.get("break_out") or None
-            break_in_2 = log.get("break_in_2") or None
-            break_out_2 = log.get("break_out_2") or None
-            lunch_in = log.get("lunch_in") or None
-            lunch_out = log.get("lunch_out") or None
-            office_out = log.get("office_out") or None
-            paid_leave_reason = log.get("paid_leave_reason") or None
-            extra_break_ins_json = json.dumps(log.get("extra_break_ins", []))
-            extra_break_outs_json = json.dumps(log.get("extra_break_outs", []))
+            
+            # Prepare new values
+            office_in_new = log.get("office_in") or None
+            break_in_new = log.get("break_in") or None
+            break_out_new = log.get("break_out") or None
+            break_in_2_new = log.get("break_in_2") or None
+            break_out_2_new = log.get("break_out_2") or None
+            lunch_in_new = log.get("lunch_in") or None
+            lunch_out_new = log.get("lunch_out") or None
+            office_out_new = log.get("office_out") or None
+            paid_leave_reason_new = log.get("paid_leave_reason") or None
+            
+            # Ensure new JSON fields are always a stringified JSON array
+            extra_break_ins_new = log.get("extra_break_ins", [])
+            extra_break_outs_new = log.get("extra_break_outs", [])
+            extra_break_ins_json_new = json.dumps(extra_break_ins_new)
+            extra_break_outs_json_new = json.dumps(extra_break_outs_new)
 
+            # --- ⭐️ HISTORY LOGIC: FETCH OLD DATA ---
+            # Fetch 'id' too, if you want to be able to reference the parent attendance record later
             cur.execute("""
+                SELECT 
+                    office_in, break_in, break_out, break_in_2, break_out_2,
+                    lunch_in, lunch_out, office_out, paid_leave_reason,
+                    extra_break_ins, extra_break_outs
+                FROM attendance 
+                WHERE user_id=%s AND date=%s
+            """, (user_id, date))
+            
+            old_log = cur.fetchone()
+            log_exists = old_log is not None
+            
+            
+            fields_changed = False
+            extra_break_ins_json_old = None
+            extra_break_outs_json_old = None
+
+            if log_exists:
+                (
+                    office_in_old, break_in_old, break_out_old, break_in_2_old, break_out_2_old,
+                    lunch_in_old, lunch_out_old, office_out_old, paid_leave_reason_old,
+                    extra_break_ins_old_raw, extra_break_outs_old_raw
+                ) = old_log
+                
+                # Normalize time values for comparison
+                office_in_old = str(office_in_old) if office_in_old else None
+                break_in_old = str(break_in_old) if break_in_old else None
+                break_out_old = str(break_out_old) if break_out_old else None
+                break_in_2_old = str(break_in_2_old) if break_in_2_old else None
+                break_out_2_old = str(break_out_2_old) if break_out_2_old else None
+                lunch_in_old = str(lunch_in_old) if lunch_in_old else None
+                lunch_out_old = str(lunch_out_old) if lunch_out_old else None
+                office_out_old = str(office_out_old) if office_out_old else None
+                paid_leave_reason_old = paid_leave_reason_old
+                
+                # Convert the JSONB objects retrieved by psycopg2 back into JSON strings for insertion into history
+                # psycopg2 often returns JSONB as a Python dict/list, which needs to be dumped back to a string/JSON type for DB insertion
+                
+                # ⭐️ FIX for DatatypeMismatch: Convert Python objects back to JSON string
+                if extra_break_ins_old_raw is not None:
+                    # If psycopg2 returned a Python list/dict, dump it back to a JSON string
+                    if isinstance(extra_break_ins_old_raw, (list, dict)):
+                        extra_break_ins_json_old = json.dumps(extra_break_ins_old_raw)
+                    # Otherwise, assume it's already a JSON string from the DB
+                    else:
+                        extra_break_ins_json_old = extra_break_ins_old_raw
+                
+                if extra_break_outs_old_raw is not None:
+                    if isinstance(extra_break_outs_old_raw, (list, dict)):
+                        extra_break_outs_json_old = json.dumps(extra_break_outs_old_raw)
+                    else:
+                        extra_break_outs_json_old = extra_break_outs_old_raw
+                        
+                # Comparison: Check if any fields changed. Compare the new JSON strings against the old ones.
+                if office_in_new != office_in_old or \
+                   office_out_new != office_out_old or \
+                   lunch_in_new != lunch_in_old or \
+                   lunch_out_new != lunch_out_old or \
+                   break_in_new != break_in_old or \
+                   break_out_new != break_out_old or \
+                   break_in_2_new != break_in_2_old or \
+                   break_out_2_new != break_out_2_old or \
+                   paid_leave_reason_new != paid_leave_reason_old or \
+                   extra_break_ins_json_new != extra_break_ins_json_old or \
+                   extra_break_outs_json_new != extra_break_outs_json_old:
+                    fields_changed = True
+
+            # --- PERFORM UPDATE / INSERT ---
+            
+            update_sql = """
                 UPDATE attendance SET
                     office_in=%s, break_in=%s, break_out=%s, break_in_2=%s, break_out_2=%s,
                     lunch_in=%s, lunch_out=%s, office_out=%s, paid_leave_reason=%s,
                     extra_break_ins=%s, extra_break_outs=%s
                 WHERE user_id=%s AND date=%s
-            """, (
-                office_in, break_in, break_out, break_in_2, break_out_2,
-                lunch_in, lunch_out, office_out, paid_leave_reason,
-                extra_break_ins_json, extra_break_outs_json,
+            """
+            update_params = (
+                office_in_new, break_in_new, break_out_new, break_in_2_new, break_out_2_new,
+                lunch_in_new, lunch_out_new, office_out_new, paid_leave_reason_new,
+                extra_break_ins_json_new, extra_break_outs_json_new, # These are JSON strings
                 user_id, date
-            ))
-
-            if cur.rowcount == 0:
+            )
+            
+            cur.execute(update_sql, update_params)
+            
+            if cur.rowcount > 0:
+                updated_log_count += 1
+                
+                # --- ⭐️ HISTORY LOGIC: INSERT OLD DATA IF CHANGED (Using the FIXED JSON strings) ---
+                if log_exists and fields_changed:
+                    # Insert the OLD record into the history table
+                    cur.execute("""
+                        INSERT INTO attendance_history (
+                            user_id, date, edited_by_user_id, edited_by_email, edited_at,
+                            office_in, break_in, break_out, break_in_2, break_out_2,
+                            lunch_in, lunch_out, office_out, paid_leave_reason,
+                            extra_break_ins, extra_break_outs
+                        )
+                        VALUES (%s, %s, %s, %s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    """, (
+                        user_id, date, editor_id, session.get("email"),
+                        office_in_old, break_in_old, break_out_old, break_in_2_old, break_out_2_old,
+                        lunch_in_old, lunch_out_old, office_out_old, paid_leave_reason_old,
+                        extra_break_ins_json_old, extra_break_outs_json_old # Pass as JSON string/None
+                    ))
+                    
+                
+            elif cur.rowcount == 0 and not log_exists:
+                # INSERT logic for a new day's log
                 cur.execute("""
                     INSERT INTO attendance (
                         user_id, date, office_in, break_in, break_out,
@@ -720,12 +832,20 @@ def edit_attendance(email):
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, (
-                    user_id, date, office_in, break_in, break_out, break_in_2, break_out_2,
-                    lunch_in, lunch_out, office_out, paid_leave_reason,
-                    extra_break_ins_json, extra_break_outs_json
+                    user_id, date, office_in_new, break_in_new, break_out_new, break_in_2_new, break_out_2_new,
+                    lunch_in_new, lunch_out_new, office_out_new, paid_leave_reason_new,
+                    extra_break_ins_json_new, extra_break_outs_json_new # Pass as JSON string
                 ))
-        conn.commit()
-        resp = jsonify({"success": True, "message": "Attendance logs updated."})
+                updated_log_count += 1
+                
+        # Only commit if at least one log was processed/updated/inserted
+        if updated_log_count > 0:
+            conn.commit()
+            message = "Attendance logs updated and history recorded."
+        else:
+            message = "No valid logs provided or no changes needed."
+            
+        resp = jsonify({"success": True, "message": message})
         if allowed_origin:
             resp.headers.add("Access-Control-Allow-Origin", allowed_origin)
             resp.headers.add("Access-Control-Allow-Credentials", "true")
@@ -744,12 +864,85 @@ def edit_attendance(email):
     finally:
         cur.close()
         put_db_connection(conn)
-
-
 import json
-from datetime import date
-from calendar import monthrange
+from flask import request, jsonify, session # Ensure 'session' is imported!
 
+# Assume get_db_connection and put_db_connection are defined elsewhere
+
+@app.route("/attendance-history/<email>", methods=["GET"])
+def get_attendance_history(email):
+    # Authorization checks (Ensure only authorized users can view this)
+   
+    month = request.args.get("month") # Expects YYYY-MM
+    if not month:
+        return jsonify({"message": "Month parameter is required"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    
+    try:
+        # Step 1: Get user_id from email
+        cur.execute("SELECT user_id FROM users WHERE email=%s", (email,))
+        user_row = cur.fetchone()
+        if not user_row:
+            # Return empty history, not 404, if the user doesn't exist/has no logs
+            return jsonify({"history": {}}), 200 
+
+        user_id = user_row[0]
+        
+        # Step 2: Fetch history logs for the given month and user (SQL FIX INCLUDED)
+        cur.execute("""
+            SELECT 
+                date, edited_by_user_id, edited_by_email, edited_at,
+                office_in, break_in, break_out, break_in_2, break_out_2,
+                lunch_in, lunch_out, office_out, paid_leave_reason,
+                extra_break_ins, extra_break_outs
+            FROM attendance_history 
+            WHERE user_id=%s AND CAST(date AS TEXT) LIKE %s -- FIX: Allows LIKE operator on DATE column
+            ORDER BY date ASC, edited_at DESC;
+        """, (user_id, f"{month}-%")) 
+
+        history_records = cur.fetchall()
+        
+        # Step 3: Format the data into a structure the frontend expects: { 'YYYY-MM-DD': [log1, log2, ...], ... }
+        history_by_date = {}
+        columns = [desc[0] for desc in cur.description]
+
+        for row in history_records:
+            log = dict(zip(columns, row))
+            
+            # JSON SERIALIZATION FIX: Convert date object to string for the dict key
+            date_key = str(log['date']) 
+            
+            # CRITICAL 1: Format datetime.time objects to strings and handle None
+            for key in ['office_in', 'break_in', 'break_out', 'break_in_2', 'break_out_2', 'lunch_in', 'lunch_out', 'office_out']:
+                # The .time() objects must be converted to strings for JSON serialization
+                log[key] = str(log[key]).split('.')[0] if log[key] else None
+            
+            # CRITICAL 2: Explicitly handle JSONB fields (extra_break_ins/outs)
+            for json_key in ['extra_break_ins', 'extra_break_outs']:
+                data = log[json_key]
+                if data is not None and isinstance(data, (list, dict)):
+                    # Convert times inside array to clean strings
+                    log[json_key] = [str(t).split('.')[0] if t else None for t in data] 
+
+            # The edited_at timestamp needs to be a string
+            log['edited_at'] = str(log['edited_at']) 
+            
+            # Add this log to the date's list using the string key
+            if date_key not in history_by_date:
+                history_by_date[date_key] = []
+            history_by_date[date_key].append(log)
+
+        return jsonify({"history": history_by_date}), 200
+
+    except Exception as e:
+        # A full error log is better for debugging
+        print(f"ERROR: Failed to fetch attendance history for {email} in {month}. Details: {e}")
+        return jsonify({"message": "Internal server error"}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
 @app.route("/all-attendance")
 def all_attendance():
     month = request.args.get("month")
