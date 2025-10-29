@@ -1128,6 +1128,10 @@ def my_leave_requests():
         "chairman_remarks": r[6] or "",
     } for r in rows])
 
+from flask import Flask, request, jsonify, session, g
+from datetime import datetime, timedelta
+
+# ... your other imports, get_db_connection, put_db_connection, etc.
 
 @app.route("/all-leave-requests")
 def all_leave_requests():
@@ -1137,7 +1141,7 @@ def all_leave_requests():
         cur.execute("""
             SELECT lr.id, u.user_id, u.name, u.email, u.location,
                    lr.leave_type, lr.start_date, lr.end_date,
-                   lr.reason, lr.status, lr.chairman_remarks
+                   lr.reason, lr.status, lr.chairman_remarks, lr.actioned_by_role, lr.actioned_by_name
             FROM leave_requests lr
             JOIN users u ON lr.user_id = u.user_id
             ORDER BY lr.created_at DESC
@@ -1157,6 +1161,8 @@ def all_leave_requests():
                 "reason": r[8] or "",
                 "status": r[9],
                 "chairman_remarks": r[10] or "",
+                "actioned_by_role": r[11] or "",
+                "actioned_by_name": r[12] or "",
             })
         return jsonify(result)
     finally:
@@ -1219,12 +1225,27 @@ def leave_action():
                 """, (user_id, day))
             day += timedelta(days=1)
 
-        # Update leave request status & remarks
+        # --- Always fetch acting user's name from users table (/me logic) ---
+        if "role" in session:
+            actioned_by_role = session["role"]
+        elif hasattr(g, "user") and hasattr(g.user, "role"):
+            actioned_by_role = g.user.role
+        else:
+            actioned_by_role = "Unknown"
+
+        if "user_id" in session:
+            cur.execute("SELECT name FROM users WHERE user_id = %s", (session["user_id"],))
+            name_row = cur.fetchone()
+            actioned_by_name = name_row[0] if name_row else "Unknown"
+        else:
+            actioned_by_name = "Unknown"
+
+        # Update leave request status, remarks, actioned_by_role and actioned_by_name
         cur.execute("""
             UPDATE leave_requests
-            SET status = %s, chairman_remarks = %s
+            SET status = %s, chairman_remarks = %s, actioned_by_role = %s, actioned_by_name = %s
             WHERE id = %s
-        """, (new_status, remarks, leave_id))
+        """, (new_status, remarks, actioned_by_role, actioned_by_name, leave_id))
 
         conn.commit()
         return jsonify({"message": f"Leave request {new_status.lower()}"}), 200
