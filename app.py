@@ -1109,7 +1109,8 @@ def my_leave_requests():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, leave_type, start_date, end_date, reason, status, chairman_remarks
+        SELECT id, leave_type, start_date, end_date, reason, status,
+               chairman_remarks, actioned_by_role, actioned_by_name
         FROM leave_requests
         WHERE user_id = %s
         ORDER BY start_date DESC
@@ -1126,6 +1127,8 @@ def my_leave_requests():
         "reason": r[4] or "",
         "status": r[5],
         "chairman_remarks": r[6] or "",
+        "actioned_by_role": r[7] or "",
+        "actioned_by_name": r[8] or "",
     } for r in rows])
 
 from flask import Flask, request, jsonify, session, g
