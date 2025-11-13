@@ -355,7 +355,6 @@ def serve_salary_slip(filename):
 
 # ---------------------- PROFILE ----------------------
 # In your app.py file, locate the /me route
-
 @app.route("/me", methods=["GET"])
 def me():
     if "user_id" not in session:
@@ -366,7 +365,8 @@ def me():
     try:
         cur.execute("""
             SELECT user_id, name, email, role, image, offer_letter_url, location,
-                   employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code, department
+                   employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code, department,
+                   paid_leaves  -- Added this line
             FROM users
             WHERE user_id = %s
         """, (session["user_id"],))
@@ -384,7 +384,6 @@ def me():
             "location": user["location"],
             "employeeId": user["employee_id"],
 
-            # --- Add these lines for the missing fields ---
             "salary": float(user["salary"]) if user["salary"] is not None else None,
             "bankAccount": user["bank_account"],
             "dob": user["dob"].isoformat() if user["dob"] else None,
@@ -392,7 +391,8 @@ def me():
             "panNo": user["pan_no"],
             "ifscCode": user["ifsc_code"],
             "department": user["department"],
-            # --- End add ---
+
+            "paidLeaves": user["paid_leaves"] if user["paid_leaves"] is not None else 0,  # Added here with default 0
         }), 200
     except Exception as e:
         return jsonify({"message": str(e)}), 500
@@ -943,6 +943,11 @@ def get_attendance_history(email):
     finally:
         cur.close()
         put_db_connection(conn)
+from datetime import datetime, date
+import json
+from calendar import monthrange
+
+
 @app.route("/all-attendance")
 def all_attendance():
     month = request.args.get("month")
@@ -956,6 +961,7 @@ def all_attendance():
                 u.email, u.name, u.role, u.is_active,
                 u.salary, u.location, u.employee_id, u.image,
                 u.bank_account, u.dob, u.doj, u.pan_no, u.ifsc_code, u.department,
+                u.paid_leaves,
                 a.date, a.office_in, a.break_out, a.break_in,
                 a.break_out_2, a.break_in_2, a.lunch_out, a.lunch_in, a.office_out, a.paid_leave_reason,
                 a.extra_break_ins, a.extra_break_outs
@@ -980,12 +986,19 @@ def all_attendance():
                 email, name, role, is_active,
                 salary, location, employee_id, image,
                 bank_account, dob, doj, pan_no, ifsc_code, department,
+                paid_leaves,
                 attend_date, office_in, break_out, break_in,
                 break_out_2, break_in_2, lunch_out, lunch_in, office_out, paid_leave_reason,
                 extra_break_ins, extra_break_outs
             ) = r
 
-            # Ensure extra_break_ins and extra_break_outs are always lists
+            # Convert times, handle types
+            if attend_date and not isinstance(attend_date, (date, datetime)):
+                try:
+                    attend_date = datetime.strptime(str(attend_date), "%Y-%m-%d").date()
+                except Exception:
+                    attend_date = None
+
             if isinstance(extra_break_ins, str):
                 try:
                     extra_break_ins = json.loads(extra_break_ins)
@@ -1016,6 +1029,7 @@ def all_attendance():
                     "panNo": pan_no,
                     "ifscCode": ifsc_code,
                     "department": department,
+                    "paidLeaves": paid_leaves if paid_leaves is not None else 0,
                     "attendance": []
                 }
 
@@ -1033,30 +1047,54 @@ def all_attendance():
                     "paid_leave_reason": paid_leave_reason,
                     "extra_break_ins": extra_break_ins,
                     "extra_break_outs": extra_break_outs,
+                    "is_paid_leave_covered": False,
                 })
 
-        # Fill missing dates for attendance
+        # COVERED PAID LEAVE LOGIC: fill missed absences as present with paid leave, up to eligibility
         for user in users.values():
-            existing_dates = {rec["date"] for rec in user["attendance"]}
+            attendance_by_date = {rec["date"]: rec for rec in user["attendance"]}
+            paid_leaves_left = user.get("paidLeaves", 0)
+            filled_dates = set(attendance_by_date.keys())
+            # Fill missing dates:
             for d in all_dates:
                 d_str = d.isoformat()
-                if d_str not in existing_dates:
-                    user["attendance"].append({
-                        "date": d_str,
-                        "office_in": None,
-                        "office_out": None,
-                        "break_out": None,
-                        "break_in": None,
-                        "break_out_2": None,
-                        "break_in_2": None,
-                        "lunch_out": None,
-                        "lunch_in": None,
-                        "paid_leave_reason": None,
-                        "extra_break_ins": [],
-                        "extra_break_outs": [],
-                        "reason": "Sunday" if d.weekday() == 6 else None,
-                        "present": True if d.weekday() == 6 else False
-                    })
+                if d_str not in filled_dates:
+                    # Covered by paid leave if available, else mark as absent
+                    if paid_leaves_left > 0:
+                        user["attendance"].append({
+                            "date": d_str,
+                            "office_in": "10:00:00",
+                            "office_out": "19:00:00",
+                            "break_out": None,
+                            "break_in": None,
+                            "break_out_2": None,
+                            "break_in_2": None,
+                            "lunch_out": None,
+                            "lunch_in": None,
+                            "paid_leave_reason": "Auto: Absent covered by Paid Leave",
+                            "extra_break_ins": [],
+                            "extra_break_outs": [],
+                            "is_paid_leave_covered": True,
+                            "present": True,
+                        })
+                        paid_leaves_left -= 1
+                    else:
+                        user["attendance"].append({
+                            "date": d_str,
+                            "office_in": None,
+                            "office_out": None,
+                            "break_out": None,
+                            "break_in": None,
+                            "break_out_2": None,
+                            "break_in_2": None,
+                            "lunch_out": None,
+                            "lunch_in": None,
+                            "paid_leave_reason": None,
+                            "extra_break_ins": [],
+                            "extra_break_outs": [],
+                            "reason": "Sunday" if d.weekday() == 6 else None,
+                            "present": True if d.weekday() == 6 else False
+                        })
             user["attendance"].sort(key=lambda x: x["date"])
 
         return jsonify(users)
@@ -1064,43 +1102,7 @@ def all_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
-@app.route("/apply-leave", methods=["POST"])
-def apply_leave():
-    
-    data = request.get_json()
-    user_id = session["user_id"]
-    leave_type = data.get("leave_type")
-    start_date = data.get("start_date")
-    end_date = data.get("end_date")
-    reason = data.get("reason")
 
-    if not all([leave_type, start_date, end_date, reason]):
-        return jsonify({"message": "Missing required fields"}), 400
-
-    try:
-        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
-        end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
-        if start_dt > end_dt:
-            return jsonify({"message": "Start date cannot be after end date"}), 400
-    except:
-        return jsonify({"message": "Invalid date format"}), 400
-
-    conn = get_db_connection()
-    cur = conn.cursor()
-    try:
-        # Insert leave request with status "Pending"
-        cur.execute("""
-            INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, reason, status)
-            VALUES (%s, %s, %s, %s, %s, 'Pending')
-        """, (user_id, leave_type, start_dt, end_dt, reason))
-        conn.commit()
-        return jsonify({"message": "Leave request submitted"}), 200
-    except Exception as e:
-        conn.rollback()
-        return jsonify({"message": f"DB Error: {str(e)}"}), 500
-    finally:
-        cur.close()
-        put_db_connection(conn)
 @app.route("/my-leave-requests")
 def my_leave_requests():
     if "user_id" not in session:
@@ -1109,7 +1111,7 @@ def my_leave_requests():
     conn = get_db_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, leave_type, start_date, end_date, reason, status,
+        SELECT id, leave_type, start_date, end_date, reason, status,half_day,
                chairman_remarks, actioned_by_role, actioned_by_name
         FROM leave_requests
         WHERE user_id = %s
@@ -1129,6 +1131,7 @@ def my_leave_requests():
         "chairman_remarks": r[6] or "",
         "actioned_by_role": r[7] or "",
         "actioned_by_name": r[8] or "",
+        "half_day": r[9],
     } for r in rows])
 
 from flask import Flask, request, jsonify, session, g
@@ -1276,7 +1279,7 @@ def create_user():
     role = data.get("role", "employee")
     image = data.get("image", "")
     location = data.get("location")
-    employee_id = data.get("employee_id")  # changed to snake_case to match DB column naming convention
+    employee_id = data.get("employee_id")  # snake_case for DB
     salary = data.get("salary")
     bank_account = data.get("bank_account")
     dob = data.get("dob")
@@ -1284,6 +1287,7 @@ def create_user():
     pan_no = data.get("pan_no")
     ifsc_code = data.get("ifsc_code")
     department = data.get("department")
+    paid_leaves = data.get("paidLeaves", 0)  # Added here with default 0
 
     if not all([name, email, password, role]):
         return jsonify({"message": "Missing required fields"}), 400
@@ -1297,10 +1301,10 @@ def create_user():
 
         cur.execute("""
             INSERT INTO users 
-            (name, email, password, role, image, location, employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code, department) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, 
-        (name, email, password, role, image, location, employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code, department))
+            (name, email, password, role, image, location, employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code, department, paid_leaves)  -- added column here
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)  -- added placeholder here
+        """,
+        (name, email, password, role, image, location, employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code, department, paid_leaves))  # added value here
         conn.commit()
         return jsonify({"message": "✅ User created successfully"}), 201
 
@@ -1309,7 +1313,8 @@ def create_user():
         return jsonify({"message": f"❌ DB Error: {str(e)}"}), 500
     finally:
         cur.close()
-        put_db_connection(conn)
+        put_db_connection(conn)  # Make sure connection release is called here
+
 
         
 @app.route("/delete-leave-request/<int:leave_id>", methods=["DELETE", "OPTIONS"])
@@ -1632,7 +1637,6 @@ from flask import request, jsonify, session
 
 from urllib.parse import unquote
 from flask import request, jsonify, session
-
 @app.route("/update-user/<email>", methods=["PUT", "POST"])
 def update_user(email):
     email = unquote(email)  # Decode URL encoded email
@@ -1642,6 +1646,7 @@ def update_user(email):
         return jsonify({"message": "Access denied"}), 403
 
     # If user is manager, restrict updates only to users with same location
+    # (Your existing location check logic here if any)
 
     data = request.get_json()
     if not data:
@@ -1660,7 +1665,8 @@ def update_user(email):
         "pan_no",
         "ifsc_code",
         "department",
-        "image"
+        "image",
+        "paidLeaves"  # Add camelCase here
     ]
 
     fields = []
@@ -1672,7 +1678,14 @@ def update_user(email):
             if field in ("dob", "doj") and value == "":
                 value = None
 
-            db_field = "employee_id" if field == "employee_id" else field
+            # Map API field to DB column name, including paidLeaves->paid_leaves
+            if field == "employee_id":
+                db_field = "employee_id"
+            elif field == "paidLeaves":
+                db_field = "paid_leaves"
+            else:
+                db_field = field
+
             fields.append(f"{db_field} = %s")
             values.append(value)
 
@@ -1707,8 +1720,44 @@ def update_user(email):
         if cur:
             cur.close()
         if conn:
-            conn.close()
+            put_db_connection(conn)  # Added your connection release function here
+@app.route("/apply-leave", methods=["POST"])
+def apply_leave():
+    
+    data = request.get_json()
+    user_id = session["user_id"]
+    leave_type = data.get("leave_type")
+    start_date = data.get("start_date")
+    end_date = data.get("end_date")
+    reason = data.get("reason")
 
+    if not all([leave_type, start_date, end_date, reason]):
+        return jsonify({"message": "Missing required fields"}), 400
+
+    try:
+        start_dt = datetime.strptime(start_date, "%Y-%m-%d").date()
+        end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
+        if start_dt > end_dt:
+            return jsonify({"message": "Start date cannot be after end date"}), 400
+    except:
+        return jsonify({"message": "Invalid date format"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        # Insert leave request with status "Pending"
+        cur.execute("""
+            INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, reason, status)
+            VALUES (%s, %s, %s, %s, %s, 'Pending')
+        """, (user_id, leave_type, start_dt, end_dt, reason))
+        conn.commit()
+        return jsonify({"message": "Leave request submitted"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": f"DB Error: {str(e)}"}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
 @app.route('/get-attendance-summary', methods=['POST'])
 def get_attendance_summary():
     if 'user_id' not in session:
