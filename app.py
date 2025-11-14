@@ -1543,6 +1543,8 @@ def save_attendance_summary():
         cur.close()
         put_db_connection(conn)
 
+
+
 @app.route('/payroll/auto-generate-slip', methods=['POST'])
 def auto_generate_payroll():
     if 'user_id' not in session:
@@ -1552,11 +1554,13 @@ def auto_generate_payroll():
     month = data.get('month') or datetime.utcnow().strftime('%Y-%m')
     requested_email = data.get("email")  # optional
 
+    current_month = datetime.utcnow().strftime('%Y-%m')
+
     conn = get_db_connection()
     cur = conn.cursor(cursor_factory=RealDictCursor)
 
     try:
-        # Fetch user details based on role and request
+        # Fetch user based on role and email
         if requested_email and session.get("role") == "chairman":
             cur.execute("SELECT user_id, name, salary FROM users WHERE email = %s", (requested_email,))
             user = cur.fetchone()
@@ -1575,12 +1579,12 @@ def auto_generate_payroll():
         name = user['name']
         salary = float(user['salary'])
 
-        # Check if payroll record exists for the month in payroll_history
+        # Check if payroll record exists for the month
         cur.execute("SELECT * FROM payroll_history WHERE user_id = %s AND month = %s", (user_id, month))
         stored_payroll = cur.fetchone()
 
-        if stored_payroll:
-            # Return previous stored salary and net payable
+        # If stored payroll exists and month is NOT current month, return stored data directly
+        if stored_payroll and month != current_month:
             payroll_slip = {
                 "employee_name": name,
                 "month": month,
@@ -1598,7 +1602,7 @@ def auto_generate_payroll():
             }
             return jsonify(payroll_slip), 200
 
-        # Otherwise, generate new payroll slip
+        # For current month or if no stored payroll, calculate fresh payroll slip
 
         # Fetch attendance summary
         cur.execute("""
@@ -1619,7 +1623,7 @@ def auto_generate_payroll():
             work_days_raw = summary['work_days']
             work_days = float(work_days_raw) if isinstance(work_days_raw, Decimal) else float(work_days_raw)
         else:
-            # Fallback values
+            # Fallback to whole month days with 4 Sundays assumed, zero attendances
             total_days = monthrange(int(month[:4]), int(month[5:]))[1]
             sundays = 4
             full_days = 0
@@ -1628,13 +1632,11 @@ def auto_generate_payroll():
             absent_days = total_days - sundays
             work_days = 0.0
 
-        # Calculate payable salary
         denominator = max(total_days - sundays, 1)
         average_per_day = round(work_days / denominator, 2)
         daily_salary = salary / denominator
         payable_salary = round(work_days * daily_salary, 2)
 
-        # Build payroll slip data
         payroll_slip = {
             "employee_name": name,
             "month": month,
@@ -1651,35 +1653,35 @@ def auto_generate_payroll():
             "generated_at": datetime.utcnow().isoformat() + "Z"
         }
 
-        # Store the generated payroll in payroll_history to preserve for that month
+        now_iso = datetime.utcnow().isoformat() + "Z"
+
+        # Insert or update payroll_history for this month to preserve record
         cur.execute("SELECT id FROM payroll_history WHERE user_id = %s AND month = %s", (user_id, month))
         existing_record = cur.fetchone()
 
         if existing_record:
-            # Update existing record
             cur.execute("""
                 UPDATE payroll_history
                 SET base_salary = %s, net_payable = %s, full_days = %s, half_days = %s,
-                    paid_leaves = %s, absent_days = %s, work_days = %s, payable_salary = %s, generated_at = %s
+                    paid_leaves = %s, absent_days = %s, work_days = %s, payable_salary = %s, generated_at = %s,
+                    total_days = %s, sundays = %s, average_per_day = %s
                 WHERE id = %s
             """, (
                 salary, payable_salary, full_days, half_days, paid_leaves, absent_days,
-                work_days, payable_salary, datetime.utcnow(), existing_record['id']
+                work_days, payable_salary, now_iso, total_days, sundays, average_per_day, existing_record['id']
             ))
         else:
-            # Insert new record
             cur.execute("""
                 INSERT INTO payroll_history
                 (user_id, month, base_salary, net_payable, full_days, half_days, paid_leaves,
-                 absent_days, work_days, payable_salary, generated_at)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                 absent_days, work_days, payable_salary, generated_at, total_days, sundays, average_per_day)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 user_id, month, salary, payable_salary, full_days, half_days, paid_leaves,
-                absent_days, work_days, payable_salary, datetime.utcnow()
+                absent_days, work_days, payable_salary, now_iso, total_days, sundays, average_per_day
             ))
 
         conn.commit()
-
         return jsonify(payroll_slip), 200
 
     finally:
