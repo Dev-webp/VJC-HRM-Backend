@@ -1110,32 +1110,35 @@ def my_leave_requests():
 
     conn = get_db_connection()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT id, leave_type, start_date, end_date, reason, status,half_day,
-               chairman_remarks, actioned_by_role, actioned_by_name
-        FROM leave_requests
-        WHERE user_id = %s
-        ORDER BY start_date DESC
-    """, (session["user_id"],))
-    rows = cur.fetchall()
-    cur.close()
-    put_db_connection(conn)
+    try:
+        cur.execute("""
+            SELECT id, leave_type, start_date, end_date, reason, status, half_day, full_day,
+                   chairman_remarks, actioned_by_role, actioned_by_name
+            FROM leave_requests
+            WHERE user_id = %s
+            ORDER BY start_date DESC
+        """, (session["user_id"],))
+        rows = cur.fetchall()
 
-    return jsonify([{
-        "id": r[0],
-        "leave_type": r[1],
-        "start_date": r[2].strftime("%Y-%m-%d"),
-        "end_date": r[3].strftime("%Y-%m-%d"),
-        "reason": r[4] or "",
-        "status": r[5],
-        "chairman_remarks": r[6] or "",
-        "actioned_by_role": r[7] or "",
-        "actioned_by_name": r[8] or "",
-        "half_day": r[9],
-    } for r in rows])
+        result = [{
+            "id": r[0],
+            "leave_type": r[1],
+            "start_date": r[2].strftime("%Y-%m-%d") if r[2] else None,
+            "end_date": r[3].strftime("%Y-%m-%d") if r[3] else None,
+            "reason": r[4] or "",
+            "status": r[5],
+            "half_day": r[6],
+            "full_day": r[7],
+            "chairman_remarks": r[8] or "",
+            "actioned_by_role": r[9] or "",
+            "actioned_by_name": r[10] or "",
+        } for r in rows]
 
-from flask import Flask, request, jsonify, session, g
-from datetime import datetime, timedelta
+        return jsonify(result)
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
 
 # ... your other imports, get_db_connection, put_db_connection, etc.
 
@@ -1174,6 +1177,10 @@ def all_leave_requests():
     finally:
         cur.close()
         put_db_connection(conn)
+from flask import request, jsonify, session, g
+from datetime import datetime, timedelta
+from flask import request, jsonify, session, g
+from datetime import datetime, timedelta
 
 @app.route("/leave-action", methods=["POST"])
 def leave_action():
@@ -1181,6 +1188,14 @@ def leave_action():
     leave_id = data.get("id")
     action = data.get("action")
     remarks = data.get("remarks", "")
+    half_day = data.get("half_day", False)
+    full_day = data.get("full_day", False)
+
+    # Convert possible string "true"/"false" to boolean
+    if isinstance(half_day, str):
+        half_day = half_day.lower() == "true"
+    if isinstance(full_day, str):
+        full_day = full_day.lower() == "true"
 
     if not leave_id or action not in ("approve", "reject"):
         return jsonify({"message": "Invalid input"}), 400
@@ -1189,7 +1204,7 @@ def leave_action():
     cur = conn.cursor()
 
     try:
-        # Fetch leave record
+        # Fetch leave request info
         cur.execute("""
             SELECT user_id, leave_type, start_date, end_date, status
             FROM leave_requests WHERE id = %s
@@ -1205,33 +1220,66 @@ def leave_action():
 
         new_status = "Approved" if action == "approve" else "Rejected"
 
-        # Convert dates if needed
+        # Convert string dates to date object if needed
         if isinstance(start_date, str):
             start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
         if isinstance(end_date, str):
             end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
 
-        day = start_date
-        while day <= end_date:
-            if new_status == "Approved" and leave_type and "earned" in leave_type.lower():
-                # Mark as paid leave day
+        # Attendance logic for earned leave
+        if new_status == "Approved" and leave_type and "earned" in leave_type.lower():
+            if half_day and not full_day:
+                # Mark only one (half day) - only start_date gets attendance
                 cur.execute("""
-                    INSERT INTO attendance (user_id, date, present, paid_leave_reason, leave_type)
-                    VALUES (%s, %s, TRUE, %s, %s)
+                    INSERT INTO attendance (user_id, date, present, paid_leave_reason, leave_type, half_day, full_day)
+                    VALUES (%s, %s, TRUE, %s, %s, TRUE, FALSE)
                     ON CONFLICT (user_id, date)
-                    DO UPDATE SET present = TRUE, paid_leave_reason = EXCLUDED.paid_leave_reason, leave_type = EXCLUDED.leave_type
-                """, (user_id, day, "Earned Leave", leave_type))
+                    DO UPDATE SET present = TRUE,
+                                  paid_leave_reason = EXCLUDED.paid_leave_reason,
+                                  leave_type = EXCLUDED.leave_type,
+                                  half_day = TRUE,
+                                  full_day = FALSE
+                """, (user_id, start_date, "Earned Leave", leave_type))
+            elif full_day and not half_day:
+                # Mark all days as full_day (NOT half day)
+                day = start_date
+                while day <= end_date:
+                    cur.execute("""
+                        INSERT INTO attendance (user_id, date, present, paid_leave_reason, leave_type, half_day, full_day)
+                        VALUES (%s, %s, TRUE, %s, %s, FALSE, TRUE)
+                        ON CONFLICT (user_id, date)
+                        DO UPDATE SET present = TRUE,
+                                      paid_leave_reason = EXCLUDED.paid_leave_reason,
+                                      leave_type = EXCLUDED.leave_type,
+                                      half_day = FALSE,
+                                      full_day = TRUE
+                    """, (user_id, day, "Earned Leave", leave_type))
+                    day += timedelta(days=1)
             else:
-                # Mark as absent (unpaid)
+                # If ambiguous, fall back to one day full-day (should not happen with proper UI)
                 cur.execute("""
-                    INSERT INTO attendance (user_id, date, present)
-                    VALUES (%s, %s, FALSE)
+                    INSERT INTO attendance (user_id, date, present, paid_leave_reason, leave_type, half_day, full_day)
+                    VALUES (%s, %s, TRUE, %s, %s, FALSE, TRUE)
                     ON CONFLICT (user_id, date)
-                    DO UPDATE SET present = FALSE
+                    DO UPDATE SET present = TRUE,
+                                  paid_leave_reason = EXCLUDED.paid_leave_reason,
+                                  leave_type = EXCLUDED.leave_type,
+                                  half_day = FALSE,
+                                  full_day = TRUE
+                """, (user_id, start_date, "Earned Leave", leave_type))
+        else:
+            # For reject or other leave types, mark absent for all days
+            day = start_date
+            while day <= end_date:
+                cur.execute("""
+                    INSERT INTO attendance (user_id, date, present, half_day, full_day)
+                    VALUES (%s, %s, FALSE, FALSE, FALSE)
+                    ON CONFLICT (user_id, date)
+                    DO UPDATE SET present = FALSE, half_day = FALSE, full_day = FALSE
                 """, (user_id, day))
-            day += timedelta(days=1)
+                day += timedelta(days=1)
 
-        # --- Always fetch acting user's name from users table (/me logic) ---
+        # Get actioned_by role and name for audit trail
         if "role" in session:
             actioned_by_role = session["role"]
         elif hasattr(g, "user") and hasattr(g.user, "role"):
@@ -1246,7 +1294,7 @@ def leave_action():
         else:
             actioned_by_name = "Unknown"
 
-        # Update leave request status, remarks, actioned_by_role and actioned_by_name
+        # Update leave_requests record with status and remarks
         cur.execute("""
             UPDATE leave_requests
             SET status = %s, chairman_remarks = %s, actioned_by_role = %s, actioned_by_name = %s
@@ -1264,7 +1312,6 @@ def leave_action():
     finally:
         cur.close()
         put_db_connection(conn)
-
 
 # ---------------------- CHAIRMAN DASHBOARD ----------------------
 @app.route("/create-user", methods=["POST"])
@@ -1316,7 +1363,9 @@ def create_user():
         put_db_connection(conn)  # Make sure connection release is called here
 
 
-        
+
+from flask_cors import cross_origin
+
 @app.route("/delete-leave-request/<int:leave_id>", methods=["DELETE", "OPTIONS"])
 @cross_origin(supports_credentials=True)
 def delete_leave_request(leave_id):
@@ -1327,21 +1376,39 @@ def delete_leave_request(leave_id):
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        # Fetch leave details including user and status
         cur.execute("SELECT user_id, leave_type, start_date, end_date, status FROM leave_requests WHERE id = %s", (leave_id,))
         leave = cur.fetchone()
         if not leave:
             return jsonify({"message": "Leave request not found"}), 404
         user_id, leave_type, start_date, end_date, status = leave
+
+        # Convert dates to date object if strings (optional depending on DB driver)
+        if isinstance(start_date, str):
+            from datetime import datetime
+            start_date = datetime.strptime(start_date, "%Y-%m-%d").date()
+        if isinstance(end_date, str):
+            from datetime import datetime
+            end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
+
+        # If approved earned leave, clear paid leave attendance records in the date range
         if status.lower() == "approved" and leave_type and "earned" in leave_type.lower():
             cur.execute("""
                 UPDATE attendance
-                SET present = FALSE, paid_leave_reason = NULL, leave_type = NULL
-                WHERE user_id = %s AND date >= %s AND date <= %s AND paid_leave_reason = 'Earned Leave'
+                SET present = FALSE, paid_leave_reason = NULL, leave_type = NULL, half_day = FALSE, full_day = FALSE
+                WHERE user_id = %s 
+                AND date >= %s 
+                AND date <= %s 
+                AND paid_leave_reason = 'Earned Leave'
             """, (user_id, start_date, end_date))
+
+        # Delete the leave request
         cur.execute("DELETE FROM leave_requests WHERE id = %s", (leave_id,))
         conn.commit()
-        # Call cleanup for other stale records
-        cleanup_orphaned_paid_leave_attendance()
+
+        # Optional: Cleanup orphaned attendance if you have a function for that
+        cleanup_orphaned_paid_leave_attendance()  # Make sure this exists and is imported
+
         return jsonify({"message": "Leave request deleted and paid leave attendance cleared"}), 200
     except Exception as e:
         conn.rollback()
@@ -1349,7 +1416,6 @@ def delete_leave_request(leave_id):
     finally:
         cur.close()
         put_db_connection(conn)
-
 
 app.config.update(
     SESSION_COOKIE_SAMESITE="Lax",      # or "None" but Lax is safer for local
@@ -1784,13 +1850,20 @@ def update_user(email):
             put_db_connection(conn)  # Added your connection release function here
 @app.route("/apply-leave", methods=["POST"])
 def apply_leave():
-    
     data = request.get_json()
     user_id = session["user_id"]
     leave_type = data.get("leave_type")
     start_date = data.get("start_date")
     end_date = data.get("end_date")
     reason = data.get("reason")
+    half_day = data.get("half_day", False)
+    full_day = data.get("full_day", False)
+
+    # Convert possible string "true"/"false" to boolean
+    if isinstance(half_day, str):
+        half_day = half_day.lower() == "true"
+    if isinstance(full_day, str):
+        full_day = full_day.lower() == "true"
 
     if not all([leave_type, start_date, end_date, reason]):
         return jsonify({"message": "Missing required fields"}), 400
@@ -1806,11 +1879,11 @@ def apply_leave():
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Insert leave request with status "Pending"
+        # Insert leave request with status "Pending" and with half_day, full_day flags!
         cur.execute("""
-            INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, reason, status)
-            VALUES (%s, %s, %s, %s, %s, 'Pending')
-        """, (user_id, leave_type, start_dt, end_dt, reason))
+            INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, reason, status, half_day, full_day)
+            VALUES (%s, %s, %s, %s, %s, 'Pending', %s, %s)
+        """, (user_id, leave_type, start_dt, end_dt, reason, half_day, full_day))
         conn.commit()
         return jsonify({"message": "Leave request submitted"}), 200
     except Exception as e:
@@ -1819,6 +1892,7 @@ def apply_leave():
     finally:
         cur.close()
         put_db_connection(conn)
+
 @app.route('/get-attendance-summary', methods=['POST'])
 def get_attendance_summary():
     if 'user_id' not in session:
