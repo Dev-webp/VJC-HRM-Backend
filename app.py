@@ -201,23 +201,76 @@ def login():
     if request.method == "GET":
         return "✅ Backend running. Use POST to login."
 
+    # --- 1. EXTRACT CREDENTIALS AND NEW TRACKING DATA ---
     email = request.form.get("email")
     password = request.form.get("password")
-
+    
+    # New tracking data fields from frontend
+    ip_address = request.form.get("ip_address")
+    city = request.form.get("city")
+    region = request.form.get("region")
+    country = request.form.get("country")
+    isp_org = request.form.get("isp_org")
+    os_name = request.form.get("os_name")
+    browser_name = request.form.get("browser_name")
+    user_agent = request.form.get("user_agent") # Full User-Agent string
+    device_name = request.form.get("device_name")
     conn = get_db_connection()
     cur = conn.cursor()
+
+    # --- 2. AUTHENTICATION LOGIC ---
     cur.execute("SELECT user_id, password, role FROM users WHERE email = %s", (email,))
     user = cur.fetchone()
-    cur.close()
-    put_db_connection(conn)
-
+    
+    # If user exists AND password is correct
     if user and password == user[1]:
-        session["user_id"] = user[0]
+        # Set session variables
+        user_id = user[0]
+        session["user_id"] = user_id
         session["role"] = user[2]
         session["email"] = email
+        
+        # --- 3. LOG SUCCESSFUL LOGIN WITH TRACKING DATA ---
+        try:
+            cur.execute("""
+                INSERT INTO login_logs 
+                (user_id, login_time, ip_address, city, region, country, isp_org, os_name, browser_name, user_agent,device_name, success)
+                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
+            """, (user_id, ip_address, city, region, country, isp_org, os_name, browser_name, user_agent,device_name))
+            conn.commit()
+        except Exception as e:
+            # Handle logging error without failing the login
+            print(f"Error logging login event for user {user_id}: {e}")
+            conn.rollback()
+
+
+        cur.close()
+        put_db_connection(conn)
         return redirect("/dashboard")
     
-    return "❌ Invalid credentials", 401
+    # --- 4. LOG FAILED LOGIN ATTEMPT (Optional, but highly recommended for security) ---
+    else:
+        # Check if email exists to get a user_id for logging
+        if user:
+            user_id = user[0]
+        else:
+            user_id = None # Log with no user_id if email not found
+
+        try:
+            # Log failure attempt (we log all the same tracking data)
+            cur.execute("""
+                INSERT INTO login_logs 
+                (user_id, login_time, ip_address, city, region, country, isp_org, os_name, browser_name, user_agent, device_name, success)
+                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
+            """, (user_id, ip_address, city, region, country, isp_org, os_name, browser_name, user_agent, device_name))
+            conn.commit()
+        except Exception as e:
+            print(f"Error logging failed login event: {e}")
+            conn.rollback()
+
+        cur.close()
+        put_db_connection(conn)
+        return "❌ Invalid credentials", 401
 
 @app.route("/logout")
 def logout():
@@ -1063,8 +1116,8 @@ def all_attendance():
                     if paid_leaves_left > 0:
                         user["attendance"].append({
                             "date": d_str,
-                            "office_in": "10:00:00",
-                            "office_out": "19:00:00",
+                            "office_in": None,
+                            "office_out": None,
                             "break_out": None,
                             "break_in": None,
                             "break_out_2": None,
@@ -1075,7 +1128,7 @@ def all_attendance():
                             "extra_break_ins": [],
                             "extra_break_outs": [],
                             "is_paid_leave_covered": True,
-                            "present": True,
+                            "present": False,  # or True, up to your logic
                         })
                         paid_leaves_left -= 1
                     else:
