@@ -201,68 +201,115 @@ def login():
     if request.method == "GET":
         return "✅ Backend running. Use POST to login."
 
-    # --- 1. EXTRACT CREDENTIALS AND NEW TRACKING DATA ---
+    # 1. Extract credentials + tracking data
     email = request.form.get("email")
     password = request.form.get("password")
-    
-    # New tracking data fields from frontend
-    ip_address = request.form.get("ip_address")
-    city = request.form.get("city")
-    region = request.form.get("region")
-    country = request.form.get("country")
-    isp_org = request.form.get("isp_org")
-    os_name = request.form.get("os_name")
+
+    ip_address   = request.form.get("ip_address")
+    city         = request.form.get("city")
+    region       = request.form.get("region")
+    country      = request.form.get("country")
+    isp_org      = request.form.get("isp_org")
+    os_name      = request.form.get("os_name")
     browser_name = request.form.get("browser_name")
-    user_agent = request.form.get("user_agent") # Full User-Agent string
-    device_name = request.form.get("device_name")
+    user_agent   = request.form.get("user_agent")
+    device_name  = request.form.get("device_name")
+
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # --- 2. AUTHENTICATION LOGIC ---
-    cur.execute("SELECT user_id, password, role FROM users WHERE email = %s", (email,))
+    # 2. Get user with name & email
+    cur.execute(
+        "SELECT user_id, password, role, name, email FROM users WHERE email = %s",
+        (email,),
+    )
     user = cur.fetchone()
-    
-    # If user exists AND password is correct
+
     if user and password == user[1]:
-        # Set session variables
-        user_id = user[0]
+        # success
+        user_id   = user[0]
+        role      = user[2]
+        full_name = user[3]
+        user_mail = user[4]
+
         session["user_id"] = user_id
-        session["role"] = user[2]
-        session["email"] = email
-        
-        # --- 3. LOG SUCCESSFUL LOGIN WITH TRACKING DATA ---
+        session["role"]    = role
+        session["email"]   = user_mail
+
         try:
-            cur.execute("""
-                INSERT INTO login_logs 
-                (user_id, login_time, ip_address, city, region, country, isp_org, os_name, browser_name, user_agent,device_name, success)
-                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, TRUE)
-            """, (user_id, ip_address, city, region, country, isp_org, os_name, browser_name, user_agent,device_name))
+            cur.execute(
+                """
+                INSERT INTO login_logs
+                (user_id, user_name, user_email,
+                 login_time, ip_address, city, region, country,
+                 isp_org, os_name, browser_name, user_agent, device_name, success)
+                VALUES
+                (%s, %s, %s,
+                 NOW(), %s, %s, %s, %s,
+                 %s, %s, %s, %s, %s, TRUE)
+                """,
+                (
+                    user_id,
+                    full_name,
+                    user_mail,
+                    ip_address,
+                    city,
+                    region,
+                    country,
+                    isp_org,
+                    os_name,
+                    browser_name,
+                    user_agent,
+                    device_name,
+                ),
+            )
             conn.commit()
         except Exception as e:
-            # Handle logging error without failing the login
             print(f"Error logging login event for user {user_id}: {e}")
             conn.rollback()
-
 
         cur.close()
         put_db_connection(conn)
         return redirect("/dashboard")
-    
-    # --- 4. LOG FAILED LOGIN ATTEMPT (Optional, but highly recommended for security) ---
+
     else:
-        # Check if email exists to get a user_id for logging
+        # failed login: still try to attach user info if email exists
         if user:
-            user_id = user[0]
+            user_id   = user[0]
+            full_name = user[3]
+            user_mail = user[4]
         else:
-            user_id = None # Log with no user_id if email not found
+            user_id   = None
+            full_name = None
+            user_mail = email  # what user typed, may not exist
 
         try:
-            # Log failure attempt (we log all the same tracking data)
-            cur.execute("""
-                INSERT INTO login_logs 
-                (user_id, login_time, ip_address, city, region, country, isp_org, os_name, browser_name, user_agent, device_name, success)
-                VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, FALSE)
-            """, (user_id, ip_address, city, region, country, isp_org, os_name, browser_name, user_agent, device_name))
+            cur.execute(
+                """
+                INSERT INTO login_logs
+                (user_id, user_name, user_email,
+                 login_time, ip_address, city, region, country,
+                 isp_org, os_name, browser_name, user_agent, device_name, success)
+                VALUES
+                (%s, %s, %s,
+                 NOW(), %s, %s, %s, %s,
+                 %s, %s, %s, %s, %s, FALSE)
+                """,
+                (
+                    user_id,
+                    full_name,
+                    user_mail,
+                    ip_address,
+                    city,
+                    region,
+                    country,
+                    isp_org,
+                    os_name,
+                    browser_name,
+                    user_agent,
+                    device_name,
+                ),
+            )
             conn.commit()
         except Exception as e:
             print(f"Error logging failed login event: {e}")
@@ -271,6 +318,23 @@ def login():
         cur.close()
         put_db_connection(conn)
         return "❌ Invalid credentials", 401
+
+@app.route("/login-logs", methods=["GET"])
+def get_login_logs():
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    cur.execute("SELECT * FROM login_logs ORDER BY login_time DESC")
+    rows = cur.fetchall()
+
+    colnames = [desc[0] for desc in cur.description]
+    result = [dict(zip(colnames, row)) for row in rows]
+
+    cur.close()
+    put_db_connection(conn)
+
+    return {"logs": result}
+    
 
 @app.route("/logout")
 def logout():
