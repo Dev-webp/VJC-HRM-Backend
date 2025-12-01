@@ -1124,7 +1124,7 @@ def all_attendance():
                             "break_in_2": None,
                             "lunch_out": None,
                             "lunch_in": None,
-                            "paid_leave_reason": "Auto: Absent covered by Paid Leave",
+                            "paid_leave_reason": None,
                             "extra_break_ins": [],
                             "extra_break_outs": [],
                             "is_paid_leave_covered": True,
