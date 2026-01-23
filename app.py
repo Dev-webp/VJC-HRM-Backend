@@ -26,8 +26,11 @@ from psycopg2.extras import RealDictCursor
 from decimal import Decimal
 from openpyxl import Workbook
 from io import BytesIO
+from flask import Flask, jsonify, request
+from flask_socketio import SocketIO, emit
+from flask_cors import CORS
 app = Flask(__name__)
-
+socketio = SocketIO(app, cors_allowed_origins="*")
 IST = pytz.timezone('Asia/Kolkata')
 OFFICE_IPS = [
     "171.76.84.77", 
@@ -197,144 +200,31 @@ def serve_profile_image(filename):
     return send_from_directory(PROFILE_UPLOAD_FOLDER, filename, as_attachment=False)
 @app.route("/", methods=["GET", "POST"])
 @cross_origin(supports_credentials=True)
+@app.route("/login", methods=["GET", "POST"], endpoint="user_login")
 def login():
+
     if request.method == "GET":
         return "✅ Backend running. Use POST to login."
 
-    # 1. Extract credentials + tracking data
     email = request.form.get("email")
     password = request.form.get("password")
 
-    ip_address   = request.form.get("ip_address")
-    city         = request.form.get("city")
-    region       = request.form.get("region")
-    country      = request.form.get("country")
-    isp_org      = request.form.get("isp_org")
-    os_name      = request.form.get("os_name")
-    browser_name = request.form.get("browser_name")
-    user_agent   = request.form.get("user_agent")
-    device_name  = request.form.get("device_name")
-
     conn = get_db_connection()
     cur = conn.cursor()
 
-    # 2. Get user with name & email
-    cur.execute(
-        "SELECT user_id, password, role, name, email FROM users WHERE email = %s",
-        (email,),
-    )
+    cur.execute("SELECT user_id, password, role, name, email FROM users WHERE email = %s", (email,))
     user = cur.fetchone()
-
-    if user and password == user[1]:
-        # success
-        user_id   = user[0]
-        role      = user[2]
-        full_name = user[3]
-        user_mail = user[4]
-
-        session["user_id"] = user_id
-        session["role"]    = role
-        session["email"]   = user_mail
-
-        try:
-            cur.execute(
-                """
-                INSERT INTO login_logs
-                (user_id, user_name, user_email,
-                 login_time, ip_address, city, region, country,
-                 isp_org, os_name, browser_name, user_agent, device_name, success)
-                VALUES
-                (%s, %s, %s,
-                 NOW(), %s, %s, %s, %s,
-                 %s, %s, %s, %s, %s, TRUE)
-                """,
-                (
-                    user_id,
-                    full_name,
-                    user_mail,
-                    ip_address,
-                    city,
-                    region,
-                    country,
-                    isp_org,
-                    os_name,
-                    browser_name,
-                    user_agent,
-                    device_name,
-                ),
-            )
-            conn.commit()
-        except Exception as e:
-            print(f"Error logging login event for user {user_id}: {e}")
-            conn.rollback()
-
-        cur.close()
-        put_db_connection(conn)
-        return redirect("/dashboard")
-
-    else:
-        # failed login: still try to attach user info if email exists
-        if user:
-            user_id   = user[0]
-            full_name = user[3]
-            user_mail = user[4]
-        else:
-            user_id   = None
-            full_name = None
-            user_mail = email  # what user typed, may not exist
-
-        try:
-            cur.execute(
-                """
-                INSERT INTO login_logs
-                (user_id, user_name, user_email,
-                 login_time, ip_address, city, region, country,
-                 isp_org, os_name, browser_name, user_agent, device_name, success)
-                VALUES
-                (%s, %s, %s,
-                 NOW(), %s, %s, %s, %s,
-                 %s, %s, %s, %s, %s, FALSE)
-                """,
-                (
-                    user_id,
-                    full_name,
-                    user_mail,
-                    ip_address,
-                    city,
-                    region,
-                    country,
-                    isp_org,
-                    os_name,
-                    browser_name,
-                    user_agent,
-                    device_name,
-                ),
-            )
-            conn.commit()
-        except Exception as e:
-            print(f"Error logging failed login event: {e}")
-            conn.rollback()
-
-        cur.close()
-        put_db_connection(conn)
-        return "❌ Invalid credentials", 401
-
-@app.route("/login-logs", methods=["GET"])
-def get_login_logs():
-    conn = get_db_connection()
-    cur = conn.cursor()
-
-    cur.execute("SELECT * FROM login_logs ORDER BY login_time DESC")
-    rows = cur.fetchall()
-
-    colnames = [desc[0] for desc in cur.description]
-    result = [dict(zip(colnames, row)) for row in rows]
 
     cur.close()
     put_db_connection(conn)
 
-    return {"logs": result}
-    
+    if user and password == user[1]:
+        session["user_id"] = user[0]
+        session["role"] = user[2]
+        session["email"] = user[4]
+        return redirect("/dashboard")
+    else:
+        return "❌ Invalid credentials", 401
 
 @app.route("/logout")
 def logout():
@@ -1060,6 +950,7 @@ def get_attendance_history(email):
     finally:
         cur.close()
         put_db_connection(conn)
+        
 from datetime import datetime, date
 import json
 from calendar import monthrange
@@ -1294,6 +1185,10 @@ def all_leave_requests():
     finally:
         cur.close()
         put_db_connection(conn)
+
+
+
+
 from flask import request, jsonify, session, g
 from datetime import datetime, timedelta
 from flask import request, jsonify, session, g
@@ -1871,6 +1766,131 @@ def auto_generate_payroll():
         cur.close()
         put_db_connection(conn)
 
+@app.route('/payroll/generate-slip-by-email', methods=['POST'])
+def generate_slip_by_email():
+    # Only allow Chairman to use this
+    if session.get("role") != "chairman":
+        return jsonify({"message": "Unauthorized: Chairman access only"}), 403
+
+    try:
+        data = request.get_json(silent=True) or {}
+        email = data.get('email')
+        month = data.get('month') or datetime.utcnow().strftime('%Y-%m')
+        current_month = datetime.utcnow().strftime('%Y-%m')
+
+        if not email:
+            return jsonify({"message": "Email is required"}), 400
+
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+
+        # 1️⃣ Get the user info (Full details for the slip)
+        cur.execute("""
+            SELECT user_id, name, role, department, location, dob, doj,
+                   bank_account, ifsc_code, pan_no, salary AS base_salary
+            FROM users
+            WHERE email = %s
+        """, (email,))
+        user = cur.fetchone()
+
+        if not user:
+            return jsonify({"message": "User not found"}), 404
+
+        user_id = user["user_id"]
+        salary = float(user["base_salary"] or 0)
+
+        # 2️⃣ Fetch attendance summary (SAME CALCULATION AS YOUR AUTO-GENERATE)
+        cur.execute("""
+            SELECT total_days, sundays, full_days, half_days,
+                   paid_leaves, absent_days, work_days
+            FROM attendance_summaries
+            WHERE user_id = %s AND month = %s
+        """, (user_id, month))
+        summary = cur.fetchone()
+
+        if summary:
+            total_days = int(summary['total_days'])
+            sundays = int(summary['sundays'])
+            full_days = int(summary['full_days'])
+            half_days = int(summary['half_days'])
+            paid_leaves = int(summary['paid_leaves'])
+            absent_days = int(summary['absent_days'])
+            work_days = float(summary['work_days'])
+        else:
+            # Fallback (Same as your auto-generate code)
+            year, m = map(int, month.split('-'))
+            total_days = monthrange(year, m)[1]
+            sundays = 4
+            full_days = 0
+            half_days = 0
+            paid_leaves = 0
+            absent_days = total_days - sundays
+            work_days = 0.0
+
+        # 3️⃣ THE "PERFECT" CALCULATION logic
+        # To fix the "High Amount" error, ensure work_days doesn't exceed denominator 
+        # OR use total_days if work_days includes Sundays.
+        
+        denominator = max(total_days - sundays, 1)
+        average_per_day = round(work_days / denominator, 2)
+        daily_salary = salary / denominator
+        
+        # We cap work_days at the denominator so the pay never exceeds the base salary
+        payable_work_days = min(work_days, denominator) 
+        payable_salary = round(payable_work_days * daily_salary, 2)
+
+        # 4️⃣ Prepare JSON payload
+        payroll_slip = {
+            "employee_id": user_id,
+            "employee_name": user["name"],
+            "role": user["role"],
+            "department": user["department"],
+            "location": user["location"],
+            "bank_account": user["bank_account"],
+            "ifsc_code": user["ifsc_code"],
+            "pan_no": user["pan_no"],
+            "dob": user["dob"],
+            "doj": user["doj"],
+            "month": month,
+            "base_salary": round(salary, 2),
+            "total_days": total_days,
+            "sundays": sundays,
+            "full_days": full_days,
+            "half_days": half_days,
+            "paid_leaves": paid_leaves,
+            "absent_days": absent_days,
+            "work_days": round(work_days, 2),
+            "average_per_day": average_per_day,
+            "payable_salary": payable_salary,
+            "generated_at": datetime.utcnow().isoformat() + "Z"
+        }
+
+        # 5️⃣ Sync with payroll_history (Optional but recommended)
+        # This ensures the Chairman's generation is saved just like the auto-generation
+        cur.execute("SELECT id FROM payroll_history WHERE user_id = %s AND month = %s", (user_id, month))
+        existing = cur.fetchone()
+        
+        if existing:
+            cur.execute("""
+                UPDATE payroll_history SET net_payable = %s, work_days = %s WHERE id = %s
+            """, (payable_salary, work_days, existing['id']))
+        else:
+            cur.execute("""
+                INSERT INTO payroll_history (user_id, month, base_salary, net_payable, work_days)
+                VALUES (%s, %s, %s, %s, %s)
+            """, (user_id, month, salary, payable_salary, work_days))
+
+        conn.commit()
+        return jsonify(payroll_slip), 200
+
+    except Exception as e:
+        print("Error generating slip:", e)
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
 
 from flask import request, session, jsonify
 from werkzeug.security import generate_password_hash
@@ -1968,7 +1988,7 @@ def update_user(email):
 @app.route("/apply-leave", methods=["POST"])
 def apply_leave():
     data = request.get_json()
-    user_id = session["user_id"]
+    user_id = session.get("user_id")
     leave_type = data.get("leave_type")
     start_date = data.get("start_date")
     end_date = data.get("end_date")
@@ -1976,12 +1996,13 @@ def apply_leave():
     half_day = data.get("half_day", False)
     full_day = data.get("full_day", False)
 
-    # Convert possible string "true"/"false" to boolean
+    # Convert string "true"/"false" to boolean
     if isinstance(half_day, str):
         half_day = half_day.lower() == "true"
     if isinstance(full_day, str):
         full_day = full_day.lower() == "true"
 
+    # Validate inputs
     if not all([leave_type, start_date, end_date, reason]):
         return jsonify({"message": "Missing required fields"}), 400
 
@@ -1990,25 +2011,44 @@ def apply_leave():
         end_dt = datetime.strptime(end_date, "%Y-%m-%d").date()
         if start_dt > end_dt:
             return jsonify({"message": "Start date cannot be after end date"}), 400
-    except:
+    except Exception:
         return jsonify({"message": "Invalid date format"}), 400
 
     conn = get_db_connection()
     cur = conn.cursor()
     try:
-        # Insert leave request with status "Pending" and with half_day, full_day flags!
+        # Insert leave request
         cur.execute("""
-            INSERT INTO leave_requests (user_id, leave_type, start_date, end_date, reason, status, half_day, full_day)
+            INSERT INTO leave_requests 
+            (user_id, leave_type, start_date, end_date, reason, status, half_day, full_day)
             VALUES (%s, %s, %s, %s, %s, 'Pending', %s, %s)
+            RETURNING id;
         """, (user_id, leave_type, start_dt, end_dt, reason, half_day, full_day))
+
+        new_id = cur.fetchone()[0]
         conn.commit()
-        return jsonify({"message": "Leave request submitted"}), 200
+
+        # Emit SocketIO event (real-time update for dashboard)
+        socketio.emit("newLeaveRequest", {
+            "id": new_id,
+            "user_id": user_id,
+            "leave_type": leave_type,
+            "start_date": start_date,
+            "end_date": end_date,
+            "reason": reason
+        })
+
+        return jsonify({"message": "Leave request submitted", "id": new_id}), 200
+
     except Exception as e:
         conn.rollback()
+        print("❌ DB Error:", e)
         return jsonify({"message": f"DB Error: {str(e)}"}), 500
+
     finally:
         cur.close()
         put_db_connection(conn)
+
 
 @app.route('/get-attendance-summary', methods=['POST'])
 def get_attendance_summary():
@@ -2203,5 +2243,6 @@ def assign_manager_role():
 # Get approved leaves of type 'Earned' for a particular employee
 # ---------------------- RUN ----------------------
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port, debug=True)
+    from flask_socketio import SocketIO
+    socketio = SocketIO(app, cors_allowed_origins="*")
+    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
