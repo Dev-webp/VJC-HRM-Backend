@@ -30,7 +30,21 @@ from flask import Flask, jsonify, request
 from flask_socketio import SocketIO, emit
 from flask_cors import CORS
 app = Flask(__name__)
-socketio = SocketIO(app, cors_allowed_origins="*")
+socketio = SocketIO(
+    app,
+    cors_allowed_origins=[
+        "http://hrm.vjcoverseas.com",
+        "https://hrm.vjcoverseas.com",
+        "http://localhost:3000"
+    ],
+    async_mode='eventlet',  # Changed to eventlet for Gunicorn
+    logger=True,
+    engineio_logger=True,
+    ping_timeout=60,
+    ping_interval=25,
+    transports=['websocket', 'polling'],  # Fallback to polling if websocket fails
+    path='/socket.io'  # Explicit path for Socket.IO
+)
 IST = pytz.timezone('Asia/Kolkata')
 OFFICE_IPS = [
     "171.76.84.77", 
@@ -83,7 +97,7 @@ def cleanup_orphaned_paid_leave_attendance():
 load_dotenv()
 UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads", "salary_slips")
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
-app = Flask(__name__)
+
 app.secret_key = os.getenv("FLASK_SECRET") or "fallback-secret-key"
 OFFER_LETTER_FOLDER = os.path.join(os.getcwd(), "uploads", "offer_letters")
 os.makedirs(OFFER_LETTER_FOLDER, exist_ok=True)
@@ -99,7 +113,18 @@ app.config.update(
     SESSION_COOKIE_SECURE=True
 )
 
+@socketio.on('connect')
+def handle_connect():
+    print('✅ Client connected:', request.sid)
+    emit('connection_response', {'data': 'Connected to server'})
 
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('❌ Client disconnected:', request.sid)
+
+@socketio.on('ping')
+def handle_ping():
+    emit('pong', {'data': 'Server alive'})
 # ---------------------- AUTH & SESSION ----------------------
 PROFILE_UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads", "profile_images")
 os.makedirs(PROFILE_UPLOAD_FOLDER, exist_ok=True)
@@ -2243,6 +2268,9 @@ def assign_manager_role():
 # Get approved leaves of type 'Earned' for a particular employee
 # ---------------------- RUN ----------------------
 if __name__ == "__main__":
-    from flask_socketio import SocketIO
-    socketio = SocketIO(app, cors_allowed_origins="*")
-    socketio.run(app, host="0.0.0.0", port=5000, debug=True)
+    socketio.run(
+        app,
+        host="0.0.0.0",
+        port=5000,
+        debug=True
+    )
