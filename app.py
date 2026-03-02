@@ -622,7 +622,6 @@ def mark_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
-
 @app.route("/my-attendance")
 def my_attendance():
     if "user_id" not in session:
@@ -636,13 +635,13 @@ def my_attendance():
     cur = conn.cursor()
 
     try:
-        base_query = """
-            SELECT date, office_in, break_out, break_in, break_out_2, break_in_2, 
-                   lunch_out, lunch_in, office_out, paid_leave_reason,
-                   extra_break_ins, extra_break_outs
-            FROM attendance
-            WHERE user_id = %s
-        """
+        base_query = (
+            "SELECT date, office_in, break_out, break_in, break_out_2, break_in_2, "
+            "lunch_out, lunch_in, office_out, paid_leave_reason, "
+            "extra_break_ins, extra_break_outs, leave_type "
+            "FROM attendance "
+            "WHERE user_id = %s"
+        )
         params = [user_id]
 
         if date_filter:
@@ -652,7 +651,7 @@ def my_attendance():
             base_query += " AND TO_CHAR(date, 'YYYY-MM') = %s"
             params.append(month_filter)
 
-        base_query += " ORDER BY date DESC LIMIT 100"  # OPTIMIZATION: Limit results
+        base_query += " ORDER BY date DESC LIMIT 100"
         cur.execute(base_query, params)
 
         rows = cur.fetchall()
@@ -677,7 +676,7 @@ def my_attendance():
                 "lunch_out": str(row[6]) if row[6] else "",
                 "lunch_in": str(row[7]) if row[7] else "",
                 "office_out": str(row[8]) if row[8] else "",
-                "leave_type": row[9] if row[9] else None,
+                "leave_type": row[12] if row[12] else row[9],  # ← row[12] = leave_type, fallback to paid_leave_reason
                 "extra_break_ins": extra_break_ins,
                 "extra_break_outs": extra_break_outs
             })
@@ -687,7 +686,6 @@ def my_attendance():
     finally:
         cur.close()
         put_db_connection(conn)
-
 # ==================== OPTIMIZED ALL ATTENDANCE ROUTE ====================
 @app.route("/all-attendance")
 def all_attendance():
@@ -844,7 +842,7 @@ def edit_attendance(email):
             resp.headers.add("Access-Control-Allow-Methods", "PUT,OPTIONS")
         return resp, 200
 
-    if "user_id" not in session or session.get("role") not in ("chairman", "front-desk", "manager"):
+    if "user_id" not in session or session.get("role") not in ("chairman", "mis-execuitve", "manager"):
         return jsonify({"success": False, "error": "Not authorized"}), 403
 
     editor_id = session.get("user_id")
@@ -1173,10 +1171,9 @@ def all_leave_requests():
     finally:
         cur.close()
         put_db_connection(conn)
-
 @app.route("/leave-action", methods=["POST"])
 def leave_action():
-    """OPTIMIZED: Batch attendance updates"""
+    """FIXED: Handles full_day, half_day, and default (no flag) earned leave correctly"""
     data = request.get_json()
     leave_id = data.get("id")
     action = data.get("action")
@@ -1184,6 +1181,7 @@ def leave_action():
     half_day = data.get("half_day", False)
     full_day = data.get("full_day", False)
 
+    # Normalize to boolean regardless of string/bool input
     if isinstance(half_day, str):
         half_day = half_day.lower() == "true"
     if isinstance(full_day, str):
@@ -1197,15 +1195,15 @@ def leave_action():
 
     try:
         cur.execute("""
-            SELECT user_id, leave_type, start_date, end_date, status
+            SELECT user_id, leave_type, start_date, end_date, status, half_day, full_day
             FROM leave_requests WHERE id = %s
         """, (leave_id,))
         row = cur.fetchone()
-        
+
         if not row:
             return jsonify({"message": "Leave request not found"}), 404
 
-        user_id, leave_type, start_date, end_date, current_status = row
+        user_id, leave_type, start_date, end_date, current_status, db_half_day, db_full_day = row
 
         if current_status.lower() != "pending":
             return jsonify({"message": "Leave request already processed"}), 400
@@ -1217,53 +1215,76 @@ def leave_action():
         if isinstance(end_date, str):
             end_date = datetime.strptime(end_date, "%Y-%m-%d").date()
 
-        # OPTIMIZATION: Batch insert attendance records
+        # Use DB values as fallback if frontend didn't send flags
+        # This ensures we always have the correct half_day/full_day from the original request
+        if not half_day and not full_day:
+            half_day = bool(db_half_day)
+            full_day = bool(db_full_day)
+            # If still both false, default to full day
+            if not half_day and not full_day:
+                full_day = True
+
+        from psycopg2.extras import execute_values
+
         if new_status == "Approved" and leave_type and "earned" in leave_type.lower():
-            if half_day and not full_day:
+            if half_day:
+                # ── HALF DAY EARNED LEAVE ──
                 cur.execute("""
-                    INSERT INTO attendance (user_id, date, present, paid_leave_reason, leave_type, half_day, full_day)
+                    INSERT INTO attendance (
+                        user_id, date, present, paid_leave_reason, leave_type, half_day, full_day
+                    )
                     VALUES (%s, %s, TRUE, %s, %s, TRUE, FALSE)
                     ON CONFLICT (user_id, date)
-                    DO UPDATE SET present = TRUE,
-                                  paid_leave_reason = EXCLUDED.paid_leave_reason,
-                                  leave_type = EXCLUDED.leave_type,
-                                  half_day = TRUE,
-                                  full_day = FALSE
+                    DO UPDATE SET
+                        present            = TRUE,
+                        paid_leave_reason  = EXCLUDED.paid_leave_reason,
+                        leave_type         = EXCLUDED.leave_type,
+                        half_day           = TRUE,
+                        full_day           = FALSE
                 """, (user_id, start_date, "Earned Leave", leave_type))
-            elif full_day and not half_day:
-                # Batch insert all days at once
+
+            else:
+                # ── FULL DAY EARNED LEAVE (single or multi-day) ──
                 dates_list = []
                 day = start_date
                 while day <= end_date:
                     dates_list.append((user_id, day, "Earned Leave", leave_type))
                     day += timedelta(days=1)
-                
-                from psycopg2.extras import execute_values
+
                 execute_values(cur, """
-                    INSERT INTO attendance (user_id, date, present, paid_leave_reason, leave_type, half_day, full_day)
+                    INSERT INTO attendance (
+                        user_id, date, present, paid_leave_reason, leave_type, half_day, full_day
+                    )
                     VALUES %s
                     ON CONFLICT (user_id, date)
-                    DO UPDATE SET present = TRUE,
-                                  paid_leave_reason = EXCLUDED.paid_leave_reason,
-                                  leave_type = EXCLUDED.leave_type,
-                                  half_day = FALSE,
-                                  full_day = TRUE
+                    DO UPDATE SET
+                        present            = TRUE,
+                        paid_leave_reason  = EXCLUDED.paid_leave_reason,
+                        leave_type         = EXCLUDED.leave_type,
+                        half_day           = FALSE,
+                        full_day           = TRUE
                 """, [(uid, d, True, plr, lt, False, True) for uid, d, plr, lt in dates_list])
-        else:
-            # Mark absent for rejected leaves
+
+        elif new_status == "Rejected":
+            # ── REJECTED — mark absent for all days ──
             dates_list = []
             day = start_date
             while day <= end_date:
                 dates_list.append((user_id, day))
                 day += timedelta(days=1)
-            
-            from psycopg2.extras import execute_values
+
             execute_values(cur, """
                 INSERT INTO attendance (user_id, date, present, half_day, full_day)
                 VALUES %s
                 ON CONFLICT (user_id, date)
-                DO UPDATE SET present = FALSE, half_day = FALSE, full_day = FALSE
+                DO UPDATE SET
+                    present  = FALSE,
+                    half_day = FALSE,
+                    full_day = FALSE
             """, [(uid, d, False, False, False) for uid, d in dates_list])
+
+        # NOTE: Non-earned approved leaves (Casual, Sick, WFH) intentionally
+        # do NOT touch the attendance table — they are handled as absent/grace by policy
 
         # Get actioned_by info
         actioned_by_role = session.get("role", "Unknown")
@@ -1287,7 +1308,7 @@ def leave_action():
     finally:
         cur.close()
         put_db_connection(conn)
-
+        
 @app.route("/delete-leave-request/<int:leave_id>", methods=["DELETE", "OPTIONS"])
 @cross_origin(supports_credentials=True)
 def delete_leave_request(leave_id):
@@ -2207,6 +2228,147 @@ def get_sales_entries(identifier):
     finally:
         cur.close()
         put_db_connection(conn)
+@app.route("/admin/attendance", methods=["GET"])
+def admin_get_attendance():
+    """Role-based attendance logs access"""
+    if "user_id" not in session:
+        print("❌ Unauthorized: No user_id in session")
+        return jsonify({"message": "Unauthorized"}), 403
+
+    role = session.get("role", "").strip().lower()
+    user_location = session.get("location", "").strip().lower()
+    print("🧩 ATTENDANCE DEBUG → user_id:", session.get("user_id"), 
+          "| role:", role, "| location:", user_location)
+
+    # ✅ Allowed roles: Chairman, MIS Executive, Manager
+    if role not in ["chairman", "mis-executive", "mis-execuitve", "manager"]:
+        print("🚫 Unauthorized role:", role)
+        return jsonify({"message": "Unauthorized"}), 403
+
+    employee_id = request.args.get("employee_id")
+    month = request.args.get("month")  # format: YYYY-MM
+    if not employee_id or not month:
+        print("⚠️ Missing employee_id or month:", employee_id, month)
+        return jsonify({"message": "employee_id and month are required"}), 400
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        # 🔍 Get employee’s location (to check for manager)
+        cur.execute("SELECT location FROM users WHERE user_id = %s", (employee_id,))
+        emp = cur.fetchone()
+        emp_location = emp[0].lower() if emp and emp[0] else ""
+        print("👀 Employee location:", emp_location)
+
+        # 🛡️ Managers can only see same-location data
+        if role == "manager" and emp_location != user_location:
+            print("🚫 Manager tried to access other location data:", emp_location)
+            return jsonify({"message": "Access denied: different location"}), 403
+
+        cur.execute("""
+            SELECT date, office_in, break_out, break_in, break_out_2, break_in_2,
+                   lunch_out, lunch_in, office_out, paid_leave_reason,
+                   extra_break_ins, extra_break_outs
+            FROM attendance
+            WHERE user_id = %s
+              AND TO_CHAR(date, 'YYYY-MM') = %s
+            ORDER BY date ASC
+        """, (employee_id, month))
+
+        rows = cur.fetchall()
+        print(f"✅ Attendance rows fetched: {len(rows)} for user {employee_id}")
+
+        result = []
+        for row in rows:
+            extra_break_ins = row[10] or []
+            extra_break_outs = row[11] or []
+            if isinstance(extra_break_ins, str):
+                extra_break_ins = json.loads(extra_break_ins)
+            if isinstance(extra_break_outs, str):
+                extra_break_outs = json.loads(extra_break_outs)
+
+            result.append({
+                "date": row[0].strftime("%Y-%m-%d") if row[0] else "",
+                "office_in": str(row[1]) if row[1] else "",
+                "break_out": str(row[2]) if row[2] else "",
+                "break_in": str(row[3]) if row[3] else "",
+                "break_out_2": str(row[4]) if row[4] else "",
+                "break_in_2": str(row[5]) if row[5] else "",
+                "lunch_out": str(row[6]) if row[6] else "",
+                "lunch_in": str(row[7]) if row[7] else "",
+                "office_out": str(row[8]) if row[8] else "",
+                "leave_type": row[9] if row[9] else None,
+                "extra_break_ins": extra_break_ins,
+                "extra_break_outs": extra_break_outs,
+            })
+
+        return jsonify(result), 200
+
+    except Exception as e:
+        print("💥 Error in /admin/attendance:", e)
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+@app.route("/admin/employees", methods=["GET"])
+def admin_get_employees():
+    """Role-based employee listing"""
+    if "user_id" not in session:
+        print("❌ Unauthorized: No user_id in session")
+        return jsonify({"message": "Unauthorized"}), 403
+
+    role = session.get("role", "").strip().lower()
+    user_location = session.get("location", "").strip().lower()
+    print("🧩 EMPLOYEE DEBUG → user_id:", session.get("user_id"), 
+          "| role:", role, "| location:", user_location)
+
+    # ✅ Allow Chairman, MIS Executive, and Manager
+    if role not in ["chairman", "mis-executive", "mis-execuitve", "manager"]:
+        print("🚫 Unauthorized role:", role)
+        return jsonify({"message": "Unauthorized"}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        cur.execute("SELECT user_id, name, role, location, department FROM users")
+        employees = cur.fetchall()
+        print("📊 Total employees in DB:", len(employees))
+
+        result = []
+        for emp in employees:
+            emp_role = (emp[2] or "").lower()
+            emp_loc = (emp[3] or "").lower()
+
+            # 🧩 Manager → only same-location employees
+            if role == "manager" and emp_loc != user_location:
+                continue
+
+            # 🚫 Hide Chairman only (show all others)
+            if "chairman" in emp_role:
+                continue
+
+            result.append({
+                "id": emp[0],
+                "name": emp[1],
+                "role": emp[2],
+                "location": emp[3],
+                "department": emp[4],
+            })
+
+        print(f"✅ Returning {len(result)} employees for role={role}")
+        return jsonify(result), 200
+
+    except Exception as e:
+        print("💥 Error in /admin/employees:", e)
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
 
 @app.route('/all-sales-stats-chairman', methods=['GET'])
 def get_all_sales_stats_chairman():
