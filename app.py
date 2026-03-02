@@ -1968,6 +1968,8 @@ def update_user(email):
         "ifsc_code": "ifsc_code",
         "department": "department",
         "image": "image",
+        "is_active": "is_active",
+        
         "paidLeaves": "paid_leaves"
     }
 
@@ -2185,13 +2187,11 @@ def add_sales_entry():
 
 @app.route('/sales-entries/<identifier>', methods=['GET'])
 def get_sales_entries(identifier):
-    """OPTIMIZED: Fast sales entry retrieval with limit"""
     if "user_id" not in session:
         return jsonify({"message": "Unauthorized"}), 401
 
     conn = get_db_connection()
     cur = conn.cursor()
-    
     try:
         if '@' in identifier:
             cur.execute("SELECT user_id FROM users WHERE email = %s", (identifier,))
@@ -2201,29 +2201,60 @@ def get_sales_entries(identifier):
             user_id = user[0]
         else:
             user_id = identifier
-        
+
+        # FIX: `id` is now included so frontend delete works
         cur.execute("""
-            SELECT amount, company, client_name, sale_date, remarks, created_at
-            FROM sales_entries 
+            SELECT id, amount, company, client_name, sale_date, remarks, created_at
+            FROM sales_entries
             WHERE user_id = %s
             ORDER BY sale_date DESC, created_at DESC
-            LIMIT 100
+            LIMIT 200
         """, (user_id,))
-        
+
         results = cur.fetchall()
-        
         entries = [{
-            'amount': float(row[0]) if row[0] else 0,
-            'company': row[1],
-            'client_name': row[2],
-            'sale_date': str(row[3]) if row[3] else None,
-            'remarks': row[4] or '',
-            'created_at': str(row[5]) if row[5] else None
+            'id':          row[0],
+            'amount':      float(row[1]) if row[1] else 0,
+            'company':     row[2],
+            'client_name': row[3],
+            'sale_date':   str(row[4]) if row[4] else None,
+            'remarks':     row[5] or '',
+            'created_at':  str(row[6]) if row[6] else None,
         } for row in results]
-        
+
         return jsonify(entries)
-            
     except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── CHANGE 2: Add this NEW route (fixes CORS + missing DELETE) ─
+@app.route('/sales-entry/<int:entry_id>', methods=['DELETE', 'OPTIONS'])
+@cross_origin(supports_credentials=True)
+def delete_sales_entry(entry_id):
+    if request.method == 'OPTIONS':
+        return '', 200
+
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    if session.get('role') != 'chairman':
+        return jsonify({'error': 'Only chairman can delete sales entries'}), 403
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM sales_entries WHERE id = %s", (entry_id,))
+        if not cur.fetchone():
+            return jsonify({'error': 'Entry not found'}), 404
+
+        cur.execute("DELETE FROM sales_entries WHERE id = %s", (entry_id,))
+        conn.commit()
+        return jsonify({'message': 'Deleted successfully'}), 200
+    except Exception as e:
+        conn.rollback()
         return jsonify({'error': str(e)}), 500
     finally:
         cur.close()
