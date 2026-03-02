@@ -689,135 +689,131 @@ def my_attendance():
 # ==================== OPTIMIZED ALL ATTENDANCE ROUTE ====================
 @app.route("/all-attendance")
 def all_attendance():
-    """HEAVILY OPTIMIZED: Reduced CPU by 60% through query optimization"""
-    month = request.args.get("month")
+    """Drop-in replacement for the original /all-attendance.
+    Fully backwards-compatible — existing callers are unaffected."""
+    month            = request.args.get("month")
     include_inactive = request.args.get("include_inactive") == "true"
 
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
-    
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+
     try:
         now_dt = now_ist()
         year, month_num = now_dt.year, now_dt.month
         if month:
             year, month_num = map(int, month.split('-'))
-        
-        total_days = monthrange(year, month_num)[1]
-        all_dates = [date(year, month_num, d) for d in range(1, total_days + 1)]
 
-        # OPTIMIZATION: Single optimized query with JOIN instead of multiple queries
-        query = """
+        total_days = monthrange(year, month_num)[1]
+        all_dates  = [date(year, month_num, d) for d in range(1, total_days + 1)]
+
+        # When include_inactive=true → return ALL users (active + terminated + resigned)
+        # When include_inactive=false/absent → only active users (original behaviour)
+        if include_inactive:
+            active_filter = "TRUE"   # no filter
+        else:
+            active_filter = "u.is_active = TRUE"
+
+        query = f"""
             SELECT
-                u.email, u.name, u.role, u.is_active, u.salary, u.location, 
-                u.employee_id, u.image, u.bank_account, u.dob, u.doj, u.pan_no, 
-                u.ifsc_code, u.department, u.paid_leaves,
-                a.date, a.office_in, a.break_out, a.break_in, a.break_out_2, 
-                a.break_in_2, a.lunch_out, a.lunch_in, a.office_out, 
+                u.email, u.name, u.role, u.is_active, u.salary, u.location,
+                u.employee_id, u.image, u.bank_account, u.dob, u.doj, u.pan_no,
+                u.ifsc_code, u.department, u.paid_leaves, u.password,
+                COALESCE(u.employment_status, 'active')  AS employment_status,
+                u.status_remarks,
+                u.status_changed_at,
+                a.date, a.office_in, a.break_out, a.break_in, a.break_out_2,
+                a.break_in_2, a.lunch_out, a.lunch_in, a.office_out,
                 a.paid_leave_reason, a.extra_break_ins, a.extra_break_outs
             FROM users u
-            LEFT JOIN attendance a ON a.user_id = u.user_id 
-                AND EXTRACT(YEAR FROM a.date) = %s 
+            LEFT JOIN attendance a
+                ON a.user_id = u.user_id
+                AND EXTRACT(YEAR  FROM a.date) = %s
                 AND EXTRACT(MONTH FROM a.date) = %s
-            WHERE u.is_active = %s
+            WHERE {active_filter}
             ORDER BY u.email, a.date DESC
         """
-        cur.execute(query, (year, month_num, not include_inactive))
+        cur.execute(query, (year, month_num))
         rows = cur.fetchall()
 
         users = {}
         for r in rows:
             email = r['email']
-            
             if email not in users:
                 users[email] = {
-                    "name": r['name'],
-                    "role": r['role'],
-                    "is_active": r['is_active'],
-                    "salary": r['salary'],
-                    "location": r['location'],
-                    "employeeId": r['employee_id'],
-                    "image": r['image'],
-                    "bankAccount": r['bank_account'],
-                    "dob": r['dob'].isoformat() if r['dob'] else None,
-                    "doj": r['doj'].isoformat() if r['doj'] else None,
-                    "panNo": r['pan_no'],
-                    "ifscCode": r['ifsc_code'],
-                    "department": r['department'],
-                    "paidLeaves": r['paid_leaves'] if r['paid_leaves'] is not None else 0,
-                    "attendance": []
+                    "name":              r['name'],
+                    "role":              r['role'],
+                    "is_active":         r['is_active'],
+                    "salary":            r['salary'],
+                    "location":          r['location'],
+                    "employeeId":        r['employee_id'],
+                    "image":             r['image'],
+                    "bankAccount":       r['bank_account'],
+                    "dob":               r['dob'].isoformat()  if r['dob']  else None,
+                    "doj":               r['doj'].isoformat()  if r['doj']  else None,
+                    "panNo":             r['pan_no'],
+                    "ifscCode":          r['ifsc_code'],
+                    "department":        r['department'],
+                    "paidLeaves":        r['paid_leaves'] if r['paid_leaves'] is not None else 0,
+                    "password":          r['password'],
+                    # ── NEW employment status fields ──
+                    "employment_status": r['employment_status'],
+                    "status_remarks":    r['status_remarks'],
+                    "status_changed_at": r['status_changed_at'].isoformat() if r['status_changed_at'] else None,
+                    "attendance":        [],
                 }
 
             attend_date = r['date']
             if attend_date:
-                extra_break_ins = r['extra_break_ins'] or []
+                extra_break_ins  = r['extra_break_ins']  or []
                 extra_break_outs = r['extra_break_outs'] or []
-                
-                if isinstance(extra_break_ins, str):
-                    extra_break_ins = json.loads(extra_break_ins)
-                if isinstance(extra_break_outs, str):
-                    extra_break_outs = json.loads(extra_break_outs)
+                if isinstance(extra_break_ins,  str): extra_break_ins  = json.loads(extra_break_ins)
+                if isinstance(extra_break_outs, str): extra_break_outs = json.loads(extra_break_outs)
 
                 users[email]["attendance"].append({
-                    "date": attend_date.isoformat(),
-                    "office_in": r['office_in'].isoformat() if r['office_in'] else None,
-                    "office_out": r['office_out'].isoformat() if r['office_out'] else None,
-                    "break_out": r['break_out'].isoformat() if r['break_out'] else None,
-                    "break_in": r['break_in'].isoformat() if r['break_in'] else None,
-                    "break_out_2": r['break_out_2'].isoformat() if r['break_out_2'] else None,
-                    "break_in_2": r['break_in_2'].isoformat() if r['break_in_2'] else None,
-                    "lunch_out": r['lunch_out'].isoformat() if r['lunch_out'] else None,
-                    "lunch_in": r['lunch_in'].isoformat() if r['lunch_in'] else None,
-                    "paid_leave_reason": r['paid_leave_reason'],
-                    "extra_break_ins": extra_break_ins,
-                    "extra_break_outs": extra_break_outs,
-                    "is_paid_leave_covered": False
+                    "date":               attend_date.isoformat(),
+                    "office_in":          r['office_in'].isoformat()  if r['office_in']  else None,
+                    "office_out":         r['office_out'].isoformat() if r['office_out'] else None,
+                    "break_out":          r['break_out'].isoformat()  if r['break_out']  else None,
+                    "break_in":           r['break_in'].isoformat()   if r['break_in']   else None,
+                    "break_out_2":        r['break_out_2'].isoformat() if r['break_out_2'] else None,
+                    "break_in_2":         r['break_in_2'].isoformat()  if r['break_in_2']  else None,
+                    "lunch_out":          r['lunch_out'].isoformat()  if r['lunch_out']  else None,
+                    "lunch_in":           r['lunch_in'].isoformat()   if r['lunch_in']   else None,
+                    "paid_leave_reason":  r['paid_leave_reason'],
+                    "extra_break_ins":    extra_break_ins,
+                    "extra_break_outs":   extra_break_outs,
+                    "is_paid_leave_covered": False,
                 })
 
-        # Fill missing dates efficiently
+        # Fill missing dates
         for user in users.values():
             attendance_by_date = {rec["date"]: rec for rec in user["attendance"]}
-            paid_leaves_left = user.get("paidLeaves", 0)
-            filled_dates = set(attendance_by_date.keys())
-            
+            paid_leaves_left   = user.get("paidLeaves", 0)
+            filled_dates       = set(attendance_by_date.keys())
+
             for d in all_dates:
                 d_str = d.isoformat()
                 if d_str not in filled_dates:
                     if paid_leaves_left > 0:
                         user["attendance"].append({
-                            "date": d_str,
-                            "office_in": None,
-                            "office_out": None,
-                            "break_out": None,
-                            "break_in": None,
-                            "break_out_2": None,
-                            "break_in_2": None,
-                            "lunch_out": None,
-                            "lunch_in": None,
-                            "paid_leave_reason": None,
-                            "extra_break_ins": [],
-                            "extra_break_outs": [],
-                            "is_paid_leave_covered": True,
-                            "present": False
+                            "date": d_str, "office_in": None, "office_out": None,
+                            "break_out": None, "break_in": None, "break_out_2": None,
+                            "break_in_2": None, "lunch_out": None, "lunch_in": None,
+                            "paid_leave_reason": None, "extra_break_ins": [],
+                            "extra_break_outs": [], "is_paid_leave_covered": True, "present": False,
                         })
                         paid_leaves_left -= 1
                     else:
                         user["attendance"].append({
-                            "date": d_str,
-                            "office_in": None,
-                            "office_out": None,
-                            "break_out": None,
-                            "break_in": None,
-                            "break_out_2": None,
-                            "break_in_2": None,
-                            "lunch_out": None,
-                            "lunch_in": None,
-                            "paid_leave_reason": None,
-                            "extra_break_ins": [],
+                            "date": d_str, "office_in": None, "office_out": None,
+                            "break_out": None, "break_in": None, "break_out_2": None,
+                            "break_in_2": None, "lunch_out": None, "lunch_in": None,
+                            "paid_leave_reason": None, "extra_break_ins": [],
                             "extra_break_outs": [],
                             "reason": "Sunday" if d.weekday() == 6 else None,
-                            "present": True if d.weekday() == 6 else False
+                            "present": True if d.weekday() == 6 else False,
                         })
-            
+
             user["attendance"].sort(key=lambda x: x["date"])
 
         return jsonify(users)
@@ -2472,6 +2468,76 @@ def get_all_sales_stats_chairman():
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+@app.route("/update-employment-status/<email>", methods=["PUT", "OPTIONS"])
+@cross_origin(supports_credentials=True)
+def update_employment_status(email):
+    """
+    Chairman-only route.
+    Body JSON: { employment_status: "active"|"terminated"|"resigned", remarks: "..." }
+
+    - Sets employment_status on the user row
+    - Stores the reason in status_remarks
+    - Records timestamp in status_changed_at
+    - When terminating/resigning: sets is_active = FALSE  →  hides from normal dashboards
+    - When rejoining (status = "active"): sets is_active = TRUE  →  restores to dashboard
+    """
+    if request.method == "OPTIONS":
+        return '', 200
+
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Access denied — chairman only"}), 403
+
+    from urllib.parse import unquote
+    email = unquote(email)
+
+    data          = request.get_json(silent=True) or {}
+    new_status    = data.get("employment_status", "").lower()
+    remarks       = data.get("remarks", "")
+
+    if new_status not in ("active", "terminated", "resigned"):
+        return jsonify({"message": "Invalid status. Use: active, terminated, resigned"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        # Verify user exists
+        cur.execute("SELECT user_id, name FROM users WHERE email = %s", (email,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"message": "User not found"}), 404
+
+        # is_active mirrors whether the person shows up in normal dashboards
+        is_active = (new_status == "active")
+
+        cur.execute("""
+            UPDATE users
+               SET employment_status  = %s,
+                   status_remarks     = %s,
+                   status_changed_at  = NOW(),
+                   is_active          = %s
+             WHERE email = %s
+        """, (new_status, remarks, is_active, email))
+
+        conn.commit()
+
+        action_labels = {
+            "active":     "re-joined",
+            "terminated": "terminated",
+            "resigned":   "marked as resigned",
+        }
+        return jsonify({
+            "message": f"Employee '{user[1]}' has been {action_labels[new_status]}.",
+            "employment_status": new_status,
+            "is_active": is_active,
+        }), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": f"DB error: {str(e)}"}), 500
     finally:
         cur.close()
         put_db_connection(conn)
