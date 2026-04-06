@@ -2542,7 +2542,1740 @@ def update_employment_status(email):
         cur.close()
         put_db_connection(conn)
 
+# ============================================================
+#  LEAD MANAGEMENT  —  Python / Flask backend routes
+#  Drop these into your app.py (or leads blueprint).
+#  Requires: psycopg2 RealDictCursor, existing session + socketio setup.
+# ============================================================
+#
+#  DATABASE MIGRATION — run once before deploying:
+#
+#  ALTER TABLE leads
+#    ADD COLUMN IF NOT EXISTS education          TEXT,
+#    ADD COLUMN IF NOT EXISTS experience         INT,
+#    ADD COLUMN IF NOT EXISTS domain             TEXT,
+#    ADD COLUMN IF NOT EXISTS age                INT,
+#    ADD COLUMN IF NOT EXISTS calling_city       TEXT,
+#    ADD COLUMN IF NOT EXISTS service_interested TEXT,
+#    ADD COLUMN IF NOT EXISTS lead_source        TEXT,
+#    ADD COLUMN IF NOT EXISTS additional_comments TEXT;
+#
+# ============================================================
+
+from datetime import timedelta
+from flask import request, session, jsonify
+from psycopg2.extras import RealDictCursor
+
+# ── Helper: resolve user name by id ──────────────────────────────────────────
+def _get_user_name(cur, user_id):
+    if not user_id:
+        return None
+    cur.execute("SELECT name FROM users WHERE user_id = %s", (user_id,))
+    row = cur.fetchone()
+    return row["name"] if row else None
+
+
+# ── Helper: is caller a lead creator (granted by chairman)? ──────────────────
+def _is_lead_creator(cur, user_id):
+    cur.execute("SELECT 1 FROM lead_creators WHERE user_id = %s", (user_id,))
+    return cur.fetchone() is not None
+
+
+# ── Helper: can caller create / assign / reshuffle leads? ────────────────────
+#   Chairman + Manager → always yes
+#   Lead Creator (granted) → yes
+#   Regular employee → no
+def _can_manage_leads(role, user_id, cur):
+    return role in ("chairman", "manager") or _is_lead_creator(cur, user_id)
+
+
+# ── Helper: log an assignment to history ─────────────────────────────────────
+def _log_assignment(cur, lead_id, assignee_id, assigned_by_id):
+    cur.execute(
+        "UPDATE lead_assignments SET is_current = FALSE WHERE lead_id = %s",
+        (lead_id,)
+    )
+    cur.execute(
+        """
+        INSERT INTO lead_assignments (lead_id, assignee_id, assigned_by_id, is_current)
+        VALUES (%s, %s, %s, TRUE)
+        """,
+        (lead_id, assignee_id, assigned_by_id)
+    )
+
+
+# ── Helper: serialize datetime fields in a lead row ──────────────────────────
+def _serialize_lead(row):
+    r = dict(row)
+    for key in ("created_at", "updated_at", "called_at", "deadline_at"):
+        if r.get(key):
+            r[key] = r[key].isoformat()
+    return r
+
+
+# ============================================================
+#  CHECK DUPLICATE  — real-time check on contact OR email
+#  Called by the frontend on blur.
+#  Returns existing lead info if found, plus which field matched.
+# ============================================================
+@app.route("/leads/check-duplicate", methods=["GET"])
+def leads_check_duplicate():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    contact = request.args.get("contact", "").strip()
+    email   = request.args.get("email",   "").strip()
+    field   = request.args.get("field",   "").strip()   # "contact" or "email"
+
+    if not contact and not email:
+        return jsonify({"exists": False}), 200
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # Check contact
+        if field == "contact" and contact:
+            cur.execute(
+                "SELECT id, name, contact, email, status FROM leads WHERE contact = %s LIMIT 1",
+                (contact,)
+            )
+            row = cur.fetchone()
+            if row:
+                return jsonify({"exists": True, "field": "contact", "lead": dict(row)}), 200
+            return jsonify({"exists": False}), 200
+
+        # Check email
+        if field == "email" and email:
+            cur.execute(
+                "SELECT id, name, contact, email, status FROM leads WHERE email = %s LIMIT 1",
+                (email,)
+            )
+            row = cur.fetchone()
+            if row:
+                return jsonify({"exists": True, "field": "email", "lead": dict(row)}), 200
+            return jsonify({"exists": False}), 200
+
+        # Fallback: check both
+        if contact:
+            cur.execute(
+                "SELECT id, name, contact, email, status FROM leads WHERE contact = %s LIMIT 1",
+                (contact,)
+            )
+            row = cur.fetchone()
+            if row:
+                return jsonify({"exists": True, "field": "contact", "lead": dict(row)}), 200
+        if email:
+            cur.execute(
+                "SELECT id, name, contact, email, status FROM leads WHERE email = %s LIMIT 1",
+                (email,)
+            )
+            row = cur.fetchone()
+            if row:
+                return jsonify({"exists": True, "field": "email", "lead": dict(row)}), 200
+
+        return jsonify({"exists": False}), 200
+
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  CREATE LEAD
+#  - Chairman, Manager, and granted Lead Creators can create.
+#  - Server-side duplicate guard: rejects if contact OR email
+#    already exists (returns 409 with the conflicting lead).
+#  - contact and email are checked independently so we can
+#    tell the user exactly which field conflicts.
+# ============================================================
+@app.route("/leads/create", methods=["POST"])
+def create_lead():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    role    = session.get("role", "")
+    user_id = session["user_id"]
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if not _can_manage_leads(role, user_id, cur):
+            return jsonify({"message": "Access denied"}), 403
+
+        data        = request.get_json(silent=True) or {}
+        name        = (data.get("name")    or "").strip()
+        contact     = (data.get("contact") or "").strip()
+        email       = (data.get("email")   or "").strip()
+        education   = (data.get("education") or "").strip()
+        experience  = data.get("experience")
+        domain      = (data.get("domain") or "").strip()
+        age         = data.get("age")
+        calling_city        = (data.get("calling_city") or "").strip()
+        service_interested  = (data.get("service_interested") or "").strip()
+        lead_source         = (data.get("lead_source") or "").strip()
+        additional_comments = (data.get("additional_comments") or "").strip()
+        assigned_to = data.get("assigned_to")
+        force       = bool(data.get("force", False))   # bypass duplicate guard
+
+        # Mandatory field validation
+        required = {
+            "name": name, "contact": contact, "email": email,
+            "education": education, "domain": domain,
+            "calling_city": calling_city, "service_interested": service_interested,
+            "lead_source": lead_source,
+        }
+        missing = [k for k, v in required.items() if not v]
+        if experience is None or str(experience).strip() == "":
+            missing.append("experience")
+        if not age:
+            missing.append("age")
+        if missing:
+            return jsonify({"message": f"Required fields missing: {', '.join(missing)}"}), 400
+
+        # ── Duplicate guard (skipped if force=True) ───────────────────────
+        # Check contact and email independently so we can return precise errors.
+        if not force:
+            # Check contact number
+            cur.execute(
+                "SELECT id, name, contact, email FROM leads WHERE contact = %s LIMIT 1",
+                (contact,)
+            )
+            dup_contact = cur.fetchone()
+            if dup_contact:
+                return jsonify({
+                    "message": f"A lead with this mobile number already exists: {dup_contact['name']}",
+                    "duplicate_field": "contact",
+                    "existing": dict(dup_contact),
+                }), 409
+
+            # Check email
+            cur.execute(
+                "SELECT id, name, contact, email FROM leads WHERE email = %s LIMIT 1",
+                (email,)
+            )
+            dup_email = cur.fetchone()
+            if dup_email:
+                return jsonify({
+                    "message": f"A lead with this email already exists: {dup_email['name']}",
+                    "duplicate_field": "email",
+                    "existing": dict(dup_email),
+                }), 409
+
+        # 45-minute deadline (only meaningful if someone is assigned)
+        deadline = now_ist() + timedelta(minutes=45) if assigned_to else None
+
+        cur.execute(
+            """
+            INSERT INTO leads
+                (name, contact, email, education, experience, domain, age,
+                 calling_city, service_interested, lead_source, additional_comments,
+                 created_by, assigned_to, assigned_by, status, deadline_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'Pending', %s)
+            RETURNING id, created_at
+            """,
+            (name, contact, email, education,
+             int(experience) if experience is not None else None,
+             domain, int(age) if age else None,
+             calling_city, service_interested, lead_source,
+             additional_comments or None,
+             user_id, assigned_to or None, user_id if assigned_to else None,
+             deadline)
+        )
+        row        = cur.fetchone()
+        lead_id    = row["id"]
+        created_at = row["created_at"]
+
+        if assigned_to:
+            _log_assignment(cur, lead_id, assigned_to, user_id)
+
+        conn.commit()
+
+        if assigned_to:
+            assigner_name = _get_user_name(cur, user_id)
+            socketio.emit("new_lead_assigned", {
+                "lead_id":          lead_id,
+                "lead_name":        name,
+                "contact":          contact,
+                "email":            email,
+                "deadline_at":      deadline.isoformat() if deadline else None,
+                "assigned_to":      assigned_to,
+                "assigned_by_name": assigner_name,
+            }, room=f"user_{assigned_to}")
+
+        return jsonify({
+            "message":    "Lead created",
+            "id":         lead_id,
+            "created_at": created_at.isoformat(),
+            "deadline_at": deadline.isoformat() if deadline else None,
+        }), 201
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  LIST LEADS
+#  - Chairman / Manager / Lead Creator → see ALL leads (table view)
+#  - Regular employee → only their assigned leads (card view)
+# ============================================================
+@app.route("/leads", methods=["GET"])
+def list_leads():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    role    = session.get("role", "")
+    user_id = session["user_id"]
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        can_manage = _can_manage_leads(role, user_id, cur)
+
+        if can_manage:
+            cur.execute(
+                """
+                SELECT
+                    l.*,
+                    creator.name   AS creator_name,
+                    assignee.name  AS assignee_name,
+                    assignee.email AS assignee_email,
+                    assigner.name  AS assigned_by_name
+                FROM leads l
+                LEFT JOIN users creator  ON l.created_by  = creator.user_id
+                LEFT JOIN users assignee ON l.assigned_to = assignee.user_id
+                LEFT JOIN users assigner ON l.assigned_by = assigner.user_id
+                ORDER BY l.created_at DESC
+                LIMIT 500
+                """
+            )
+        else:
+            cur.execute(
+                """
+                SELECT
+                    l.*,
+                    creator.name  AS creator_name,
+                    assigner.name AS assigned_by_name
+                FROM leads l
+                LEFT JOIN users creator  ON l.created_by  = creator.user_id
+                LEFT JOIN users assigner ON l.assigned_by = assigner.user_id
+                WHERE l.assigned_to = %s
+                ORDER BY l.created_at DESC
+                LIMIT 200
+                """,
+                (user_id,)
+            )
+
+        return jsonify([_serialize_lead(r) for r in cur.fetchall()]), 200
+
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  MY ACCESS
+#  Returns: canCreate (bool), hasLeads (bool)
+# ============================================================
+@app.route("/leads/my-access", methods=["GET"])
+def leads_my_access():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    role    = session.get("role", "")
+    user_id = session["user_id"]
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        can_create = _can_manage_leads(role, user_id, cur)
+
+        cur.execute(
+            "SELECT 1 FROM lead_assignments WHERE assignee_id = %s LIMIT 1",
+            (user_id,)
+        )
+        has_leads = cur.fetchone() is not None
+
+        return jsonify({"canCreate": can_create, "hasLeads": has_leads}), 200
+
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  UPDATE LEAD  (status + optional reassign)
+#  - Chairman / Manager / Lead Creator → can update AND reassign
+#  - Assigned employee → can only update status + add remarks
+# ============================================================
+@app.route("/leads/<int:lead_id>", methods=["PUT"])
+def update_lead(lead_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    role    = session.get("role", "")
+    user_id = session["user_id"]
+    data    = request.get_json(silent=True) or {}
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT id, assigned_to, created_by, status FROM leads WHERE id = %s",
+            (lead_id,)
+        )
+        lead = cur.fetchone()
+        if not lead:
+            return jsonify({"message": "Lead not found"}), 404
+
+        can_manage = _can_manage_leads(role, user_id, cur)
+
+        if not can_manage and user_id != lead["assigned_to"]:
+            return jsonify({"message": "Access denied"}), 403
+
+        fields, values = [], []
+
+        if "status" in data:
+            allowed = ("Pending", "Called", "No Answer", "Follow Up", "Converted", "Dropped")
+            if data["status"] not in allowed:
+                return jsonify({"message": f"Invalid status. Allowed: {allowed}"}), 400
+            fields.append("status = %s")
+            values.append(data["status"])
+            if data["status"] == "Called":
+                fields.append("called_at = %s")
+                values.append(now_ist())
+
+        if "assigned_to" in data and can_manage:
+            new_assignee = data["assigned_to"]
+
+            if new_assignee and new_assignee != lead["assigned_to"]:
+                new_deadline = now_ist() + timedelta(minutes=45)
+                fields += ["assigned_to = %s", "assigned_by = %s", "deadline_at = %s"]
+                values += [new_assignee, user_id, new_deadline]
+
+                _log_assignment(cur, lead_id, new_assignee, user_id)
+
+                assigner_name = _get_user_name(cur, user_id)
+                cur.execute("SELECT name FROM leads WHERE id = %s", (lead_id,))
+                lead_name_row = cur.fetchone()
+                socketio.emit("new_lead_assigned", {
+                    "lead_id":          lead_id,
+                    "lead_name":        lead_name_row["name"] if lead_name_row else "",
+                    "assigned_to":      new_assignee,
+                    "assigned_by_name": assigner_name,
+                    "deadline_at":      new_deadline.isoformat(),
+                }, room=f"user_{new_assignee}")
+
+            elif new_assignee is None:
+                fields += ["assigned_to = %s", "assigned_by = %s", "deadline_at = %s"]
+                values += [None, None, None]
+
+        if not fields:
+            return jsonify({"message": "Nothing to update"}), 400
+
+        fields.append("updated_at = %s")
+        values.append(now_ist())
+        values.append(lead_id)
+
+        cur.execute(
+            f"UPDATE leads SET {', '.join(fields)} WHERE id = %s",
+            tuple(values)
+        )
+        conn.commit()
+        return jsonify({"message": "Lead updated"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  ADD REMARK
+#  - Chairman / Manager / Lead Creator → can add remarks
+#  - Assigned employee → can add remarks to their own leads
+# ============================================================
+@app.route("/leads/<int:lead_id>/remarks", methods=["POST"])
+def add_lead_remark(lead_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    role    = session.get("role", "")
+    user_id = session["user_id"]
+    data    = request.get_json(silent=True) or {}
+
+    remark         = (data.get("remark") or "").strip()
+    status_at_time = (data.get("status_at_time") or "").strip() or None
+
+    if not remark:
+        return jsonify({"message": "remark cannot be empty"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT id, assigned_to, status FROM leads WHERE id = %s",
+            (lead_id,)
+        )
+        lead = cur.fetchone()
+        if not lead:
+            return jsonify({"message": "Lead not found"}), 404
+
+        can_manage = _can_manage_leads(role, user_id, cur)
+        if not can_manage and user_id != lead["assigned_to"]:
+            return jsonify({"message": "Access denied"}), 403
+
+        if not status_at_time:
+            status_at_time = lead["status"]
+
+        cur.execute(
+            """
+            INSERT INTO lead_remarks (lead_id, author_id, remark, status_at_time)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, created_at
+            """,
+            (lead_id, user_id, remark, status_at_time)
+        )
+        remark_row = cur.fetchone()
+
+        cur.execute(
+            """
+            UPDATE leads
+            SET remarks_count = remarks_count + 1,
+                latest_remark = %s,
+                updated_at    = %s
+            WHERE id = %s
+            """,
+            (remark, now_ist(), lead_id)
+        )
+
+        conn.commit()
+        return jsonify({
+            "message":    "Remark added",
+            "remark_id":  remark_row["id"],
+            "created_at": remark_row["created_at"].isoformat(),
+        }), 201
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  LEAD HISTORY
+# ============================================================
+@app.route("/leads/<int:lead_id>/history", methods=["GET"])
+def lead_history(lead_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    role    = session.get("role", "")
+    user_id = session["user_id"]
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "SELECT id, assigned_to FROM leads WHERE id = %s",
+            (lead_id,)
+        )
+        lead = cur.fetchone()
+        if not lead:
+            return jsonify({"message": "Lead not found"}), 404
+
+        can_manage = _can_manage_leads(role, user_id, cur)
+
+        if not can_manage and user_id != lead["assigned_to"]:
+            cur.execute(
+                "SELECT 1 FROM lead_assignments WHERE lead_id = %s AND assignee_id = %s",
+                (lead_id, user_id)
+            )
+            if not cur.fetchone():
+                return jsonify({"message": "Access denied"}), 403
+
+        cur.execute(
+            """
+            SELECT
+                la.id,
+                la.assigned_at,
+                la.is_current,
+                assignee.name  AS assignee_name,
+                assigner.name  AS assigned_by_name
+            FROM lead_assignments la
+            LEFT JOIN users assignee ON la.assignee_id    = assignee.user_id
+            LEFT JOIN users assigner ON la.assigned_by_id = assigner.user_id
+            WHERE la.lead_id = %s
+            ORDER BY la.assigned_at ASC
+            """,
+            (lead_id,)
+        )
+        assignments = []
+        for r in cur.fetchall():
+            row = dict(r)
+            row["assigned_at"] = row["assigned_at"].isoformat()
+            assignments.append(row)
+
+        cur.execute(
+            """
+            SELECT
+                lr.id,
+                lr.remark,
+                lr.status_at_time,
+                lr.created_at,
+                author.name AS author_name
+            FROM lead_remarks lr
+            LEFT JOIN users author ON lr.author_id = author.user_id
+            WHERE lr.lead_id = %s
+            ORDER BY lr.created_at ASC
+            """,
+            (lead_id,)
+        )
+        remarks = []
+        for r in cur.fetchall():
+            row = dict(r)
+            row["created_at"] = row["created_at"].isoformat()
+            remarks.append(row)
+
+        return jsonify({"assignments": assignments, "remarks": remarks}), 200
+
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  EMPLOYEES LIST
+#  - Chairman / Manager / Lead Creator can fetch this list
+# ============================================================
+@app.route("/leads/employees", methods=["GET"])
+def leads_get_employees():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    role    = session.get("role", "")
+    user_id = session["user_id"]
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if not _can_manage_leads(role, user_id, cur):
+            return jsonify({"message": "Access denied"}), 403
+
+        cur.execute(
+            """
+            SELECT user_id, name, email, role, department, location
+            FROM users
+            WHERE is_active = TRUE
+              AND role NOT IN ('chairman')
+            ORDER BY name ASC
+            """
+        )
+        return jsonify([dict(r) for r in cur.fetchall()]), 200
+
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  LEAD CREATORS — list / grant / revoke (chairman only)
+#  Granting lead-creator access gives that employee:
+#    ✓ Create leads
+#    ✓ Assign / reshuffle leads
+#    ✓ See all leads (table view with full stats)
+#    ✗ Cannot delete leads (chairman only)
+# ============================================================
+@app.route("/leads/creators", methods=["GET"])
+def leads_list_creators():
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            """
+            SELECT lc.user_id, u.name, u.role, u.location, lc.granted_at
+            FROM lead_creators lc
+            JOIN users u ON lc.user_id = u.user_id
+            ORDER BY u.name ASC
+            """
+        )
+        rows = []
+        for r in cur.fetchall():
+            row = dict(r)
+            row["granted_at"] = row["granted_at"].isoformat()
+            rows.append(row)
+        return jsonify(rows), 200
+
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+@app.route("/leads/creators", methods=["POST"])
+def leads_grant_creator():
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+
+    data    = request.get_json(silent=True) or {}
+    user_id = data.get("user_id")
+    if not user_id:
+        return jsonify({"message": "user_id required"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            """
+            INSERT INTO lead_creators (user_id, granted_by)
+            VALUES (%s, %s)
+            ON CONFLICT (user_id) DO NOTHING
+            """,
+            (user_id, session["user_id"])
+        )
+        conn.commit()
+        return jsonify({"message": "Access granted"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+@app.route("/leads/creators/<int:target_user_id>", methods=["DELETE"])
+def leads_revoke_creator(target_user_id):
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute(
+            "DELETE FROM lead_creators WHERE user_id = %s RETURNING user_id",
+            (target_user_id,)
+        )
+        if not cur.fetchone():
+            return jsonify({"message": "User not found in creators list"}), 404
+        conn.commit()
+        return jsonify({"message": "Access revoked"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ============================================================
+#  DELETE LEAD — CHAIRMAN ONLY
+#  Lead creators can create/assign/reshuffle but NOT delete.
+# ============================================================
+@app.route("/leads/<int:lead_id>", methods=["DELETE"])
+def delete_lead(lead_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    # Strictly chairman only — not even lead creators
+    if session.get("role") != "chairman":
+        return jsonify({"message": "Access denied — chairman only"}), 403
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute(
+            "DELETE FROM leads WHERE id = %s RETURNING id, name",
+            (lead_id,)
+        )
+        deleted = cur.fetchone()
+        if not deleted:
+            return jsonify({"message": "Lead not found"}), 404
+
+        conn.commit()
+        return jsonify({"message": f"Lead '{deleted['name']}' deleted successfully"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
 # ==================== APPLICATION STARTUP ====================
+
+# ==================== CHAT SYSTEM ROUTES (FIXED) ====================
+# DROP-IN REPLACEMENT for the chat section in your app.py
+#
+# BUGS FIXED:
+# 1. Empty bubble on receiver: _enrich_message now always returns `content`
+#    as a plain string (never None/missing), and `read_by` as a plain list of ints.
+# 2. "Sent an attachment" notification: file messages now emit
+#    `content` as "" (empty string) instead of None, so the frontend
+#    can fall through to the file_name correctly.
+# 3. Room ID type mismatch: room_id is always cast to int in emitted payloads.
+# =====================================================================
+
+import os
+import time as time_module
+from werkzeug.utils import secure_filename
+from psycopg2.extras import RealDictCursor, execute_values
+from collections import defaultdict
+
+CHAT_UPLOAD_FOLDER = os.path.join(os.getcwd(), "uploads", "chat_files")
+os.makedirs(CHAT_UPLOAD_FOLDER, exist_ok=True)
+
+# Online users tracking: {user_id: {sid1, sid2, ...}}
+_online_users = defaultdict(set)
+
+
+def _enrich_message(cur, msg_dict):
+    """
+    Add reply_to info and reactions to a message dict.
+
+    CRITICAL FIXES applied here:
+    - `content` is always a string (never None) — prevents blank bubbles
+    - `room_id` is always int — prevents isCurRoom mismatch on frontend
+    - `read_by` is always a plain list of ints — consistent with frontend's toInt()
+    - `reactions` always present as list
+    """
+    r = dict(msg_dict)
+
+    # ── Ensure created_at is a string ──────────────────────────────────
+    if r.get("created_at") and not isinstance(r["created_at"], str):
+        r["created_at"] = r["created_at"].isoformat()
+
+    # ── FIX 1: content MUST be a string, never None ────────────────────
+    # If content is None (file-only message), set to "" so the frontend
+    # extractContent() returns "" and falls through to file_name correctly
+    if r.get("content") is None:
+        r["content"] = ""
+
+    # ── FIX 2: room_id MUST be an int ─────────────────────────────────
+    if r.get("room_id") is not None:
+        r["room_id"] = int(r["room_id"])
+
+    # ── FIX 3: read_by MUST be a plain list of ints ───────────────────
+    # PostgreSQL ARRAY() returns a list, but it might contain strings or
+    # the field might be missing entirely — normalise it here
+    raw_read_by = r.get("read_by") or []
+    if isinstance(raw_read_by, (list, tuple)):
+        r["read_by"] = [int(x) for x in raw_read_by if x is not None]
+    else:
+        r["read_by"] = []
+
+    # ── Reply-to info ──────────────────────────────────────────────────
+    r["reply_to_content"] = None
+    r["reply_to_sender"]  = None
+    if r.get("reply_to_id"):
+        cur.execute(
+            "SELECT content, file_name, sender_id FROM chat_messages WHERE id=%s",
+            (r["reply_to_id"],)
+        )
+        parent = cur.fetchone()
+        if parent:
+            r["reply_to_content"] = parent["content"] or (
+                f"📎 {parent['file_name']}" if parent["file_name"] else ""
+            )
+            cur.execute("SELECT name FROM users WHERE user_id=%s", (parent["sender_id"],))
+            sr = cur.fetchone()
+            r["reply_to_sender"] = sr["name"] if sr else "Unknown"
+
+    # ── Reactions ──────────────────────────────────────────────────────
+    cur.execute(
+        "SELECT emoji, user_id FROM chat_message_reactions WHERE message_id=%s",
+        (r["id"],)
+    )
+    r["reactions"] = [
+        {"emoji": row["emoji"], "user_id": int(row["user_id"])}
+        for row in cur.fetchall()
+    ]
+    return r
+
+
+# ── Serve chat files ───────────────────────────────────────────────────────────
+@app.route("/files/chat/<path:filename>")
+def serve_chat_file(filename):
+    return send_from_directory(CHAT_UPLOAD_FOLDER, filename, as_attachment=False)
+
+
+# ── GET ALL USERS FOR CHAT ────────────────────────────────────────────────────
+@app.route("/chat/users", methods=["GET"])
+def get_chat_users():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    user_id = session["user_id"]
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            SELECT user_id, name, email, role, department, location, image
+            FROM users
+            WHERE is_active = TRUE AND user_id != %s
+            ORDER BY name ASC
+        """, (user_id,))
+        return jsonify([dict(r) for r in cur.fetchall()]), 200
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── GET ROOMS ─────────────────────────────────────────────────────────────────
+@app.route("/chat/rooms", methods=["GET"])
+def get_chat_rooms():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    user_id = session["user_id"]
+    role    = session.get("role", "")
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if role == "chairman":
+            cur.execute("""
+                SELECT r.id, r.name, r.room_type, r.department,
+                       (SELECT content FROM chat_messages
+                        WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
+                        ORDER BY created_at DESC LIMIT 1) AS last_message,
+                       (SELECT file_name FROM chat_messages
+                        WHERE room_id=r.id AND file_name IS NOT NULL
+                        ORDER BY created_at DESC LIMIT 1) AS last_file_name,
+                       (SELECT created_at FROM chat_messages
+                        WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
+                       (SELECT COUNT(*) FROM chat_messages m
+                        WHERE m.room_id=r.id
+                          AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM chat_message_reads rd
+                              WHERE rd.message_id=m.id AND rd.user_id=%s
+                          )) AS unread_count
+                FROM chat_rooms r
+                WHERE r.is_active=TRUE OR r.is_active IS NULL
+                ORDER BY last_message_at DESC NULLS LAST, r.name
+            """, (user_id,))
+        else:
+            cur.execute("""
+                SELECT r.id, r.name, r.room_type, r.department,
+                       (SELECT content FROM chat_messages
+                        WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
+                        ORDER BY created_at DESC LIMIT 1) AS last_message,
+                       (SELECT file_name FROM chat_messages
+                        WHERE room_id=r.id AND file_name IS NOT NULL
+                        ORDER BY created_at DESC LIMIT 1) AS last_file_name,
+                       (SELECT created_at FROM chat_messages
+                        WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
+                       (SELECT COUNT(*) FROM chat_messages m
+                        WHERE m.room_id=r.id
+                          AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM chat_message_reads rd
+                              WHERE rd.message_id=m.id AND rd.user_id=%s
+                          )) AS unread_count
+                FROM chat_rooms r
+                JOIN chat_room_members rm ON rm.room_id=r.id AND rm.user_id=%s
+                WHERE r.is_active=TRUE OR r.is_active IS NULL
+                ORDER BY last_message_at DESC NULLS LAST, r.name
+            """, (user_id, user_id))
+
+        rooms = []
+        for r in cur.fetchall():
+            row = dict(r)
+            row["last_message_at"] = row["last_message_at"].isoformat() if row["last_message_at"] else None
+            row["unread_count"]    = int(row["unread_count"] or 0)
+
+            # FIX: sidebar preview — show file name if no text content
+            if not row.get("last_message") and row.get("last_file_name"):
+                row["last_message"] = f"📎 {row['last_file_name']}"
+            row.pop("last_file_name", None)
+
+            if row["room_type"] == "dm":
+                cur.execute("""
+                    SELECT u.name, u.image FROM users u
+                    JOIN chat_room_members rm ON rm.user_id=u.user_id
+                    WHERE rm.room_id=%s AND u.user_id != %s LIMIT 1
+                """, (row["id"], user_id))
+                other = cur.fetchone()
+                if other:
+                    row["name"]     = other["name"]
+                    row["dm_image"] = other["image"]
+            rooms.append(row)
+        return jsonify(rooms), 200
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── GET MESSAGES ──────────────────────────────────────────────────────────────
+@app.route("/chat/room/<int:room_id>/messages", methods=["GET"])
+def get_room_messages(room_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    user_id = session["user_id"]
+    role    = session.get("role", "")
+    before  = request.args.get("before")
+    limit   = int(request.args.get("limit", 60))
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if role != "chairman":
+            cur.execute(
+                "SELECT 1 FROM chat_room_members WHERE room_id=%s AND user_id=%s",
+                (room_id, user_id)
+            )
+            if not cur.fetchone():
+                return jsonify({"message": "Access denied"}), 403
+
+        query = """
+            SELECT m.id, m.room_id, m.content, m.msg_type, m.created_at,
+                   COALESCE(m.is_edited,  FALSE) AS is_edited,
+                   COALESCE(m.is_deleted, FALSE) AS is_deleted,
+                   m.file_url, m.file_name, m.file_size, m.reply_to_id,
+                   u.user_id AS sender_id, u.name AS sender_name,
+                   u.image   AS sender_image, u.role AS sender_role,
+                   ARRAY(
+                       SELECT rd.user_id::int FROM chat_message_reads rd
+                       WHERE rd.message_id=m.id
+                   ) AS read_by
+            FROM chat_messages m
+            JOIN users u ON u.user_id=m.sender_id
+            WHERE m.room_id=%s
+        """
+        params = [room_id]
+        if before:
+            query += " AND m.id < %s"
+            params.append(int(before))
+        query += " ORDER BY m.created_at DESC LIMIT %s"
+        params.append(limit)
+
+        cur.execute(query, params)
+        rows     = cur.fetchall()
+        messages = [_enrich_message(cur, row) for row in rows]
+        messages.reverse()
+
+        # Auto-mark read
+        if messages:
+            ids = [m["id"] for m in messages]
+            execute_values(cur,
+                "INSERT INTO chat_message_reads (message_id, user_id) VALUES %s ON CONFLICT DO NOTHING",
+                [(mid, user_id) for mid in ids]
+            )
+            conn.commit()
+
+        return jsonify(messages), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── SEND TEXT MESSAGE ─────────────────────────────────────────────────────────
+@app.route("/chat/send", methods=["POST"])
+def send_chat_message():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    user_id     = session["user_id"]
+    role        = session.get("role", "")
+    data        = request.get_json(silent=True) or {}
+    room_id     = data.get("room_id")
+    content     = (data.get("content") or "").strip()
+    reply_to_id = data.get("reply_to_id") or None
+
+    if not room_id or not content:
+        return jsonify({"message": "room_id and content required"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if role != "chairman":
+            cur.execute(
+                "SELECT 1 FROM chat_room_members WHERE room_id=%s AND user_id=%s",
+                (room_id, user_id)
+            )
+            if not cur.fetchone():
+                return jsonify({"message": "Not a member of this room"}), 403
+
+        cur.execute("""
+            INSERT INTO chat_messages (room_id, sender_id, content, reply_to_id)
+            VALUES (%s, %s, %s, %s)
+            RETURNING id, created_at
+        """, (room_id, user_id, content, reply_to_id))
+        row = cur.fetchone()
+
+        cur.execute("SELECT name, image, role FROM users WHERE user_id=%s", (user_id,))
+        sender = cur.fetchone()
+        conn.commit()
+
+        # Build msg_data with _enrich_message to apply all fixes
+        msg_data = _enrich_message(cur, {
+            "id":           row["id"],
+            "room_id":      int(room_id),
+            "created_at":   row["created_at"],
+            "is_edited":    False,
+            "is_deleted":   False,
+            "msg_type":     "text",
+            "file_url":     None,
+            "file_name":    None,
+            "file_size":    None,
+            "reply_to_id":  reply_to_id,
+            # FIX: content is always the actual string here
+            "content":      content,
+            "sender_id":    user_id,
+            "sender_name":  sender["name"],
+            "sender_image": sender["image"],
+            "sender_role":  sender["role"],
+            "read_by":      [user_id],
+        })
+
+        # ✅ No include_self=False — this is an HTTP route, not a socket handler
+        socketio.emit("new_message", msg_data, room=f"chat_{room_id}")
+        return jsonify(msg_data), 201
+
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ send_chat_message error: {e}")
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── SEND FILE ─────────────────────────────────────────────────────────────────
+@app.route("/chat/send-file", methods=["POST"])
+def send_chat_file_route():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    user_id     = session["user_id"]
+    role        = session.get("role", "")
+    room_id     = request.form.get("room_id")
+    content     = request.form.get("content", "").strip()
+    reply_to_id = request.form.get("reply_to_id") or None
+
+    if not room_id:
+        return jsonify({"message": "room_id required"}), 400
+
+    file = request.files.get("file")
+    if not file or not file.filename:
+        return jsonify({"message": "No file provided"}), 400
+
+    ext = file.filename.rsplit(".", 1)[-1].lower() if "." in file.filename else ""
+    ALLOWED = {
+        "jpg","jpeg","png","gif","webp","svg","bmp","ico",
+        "pdf","doc","docx","xls","xlsx","ppt","pptx",
+        "txt","csv","zip","rar","7z",
+        "mp4","mov","avi","mkv","webm","wmv","flv",
+        "mp3","wav","ogg","aac","flac","m4a",
+    }
+    if ext not in ALLOWED:
+        return jsonify({"message": f"File type .{ext} not allowed"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if role != "chairman":
+            cur.execute(
+                "SELECT 1 FROM chat_room_members WHERE room_id=%s AND user_id=%s",
+                (room_id, user_id)
+            )
+            if not cur.fetchone():
+                return jsonify({"message": "Not a member"}), 403
+
+        safe_name   = secure_filename(file.filename)
+        unique_name = f"{int(time_module.time() * 1000)}_{safe_name}"
+        filepath    = os.path.join(CHAT_UPLOAD_FOLDER, unique_name)
+        file.save(filepath)
+        db_size = os.path.getsize(filepath)
+        db_url  = f"/files/chat/{unique_name}"
+
+        # FIX: store content as None in DB if empty (clean), but we handle
+        # it in the emitted payload below
+        cur.execute("""
+            INSERT INTO chat_messages
+                (room_id, sender_id, content, file_url, file_name, file_size, reply_to_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, created_at
+        """, (room_id, user_id, content or None, db_url, safe_name, db_size, reply_to_id))
+        row = cur.fetchone()
+
+        cur.execute("SELECT name, image, role FROM users WHERE user_id=%s", (user_id,))
+        sender = cur.fetchone()
+        conn.commit()
+
+        msg_data = _enrich_message(cur, {
+            "id":           row["id"],
+            "room_id":      int(room_id),
+            "created_at":   row["created_at"],
+            "is_edited":    False,
+            "is_deleted":   False,
+            "msg_type":     "file",
+            "file_url":     db_url,
+            "file_name":    safe_name,
+            "file_size":    db_size,
+            "reply_to_id":  reply_to_id,
+            # FIX: content is "" (empty string) not None — frontend extractContent
+            # returns "" and falls through to show file_name in notification
+            "content":      content or "",
+            "sender_id":    user_id,
+            "sender_name":  sender["name"],
+            "sender_image": sender["image"],
+            "sender_role":  sender["role"],
+            "read_by":      [user_id],
+        })
+
+        # ✅ No include_self=False — HTTP route
+        socketio.emit("new_message", msg_data, room=f"chat_{room_id}")
+        return jsonify(msg_data), 201
+
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ send-file error: {e}")
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── EDIT MESSAGE ──────────────────────────────────────────────────────────────
+@app.route("/chat/message/<int:msg_id>", methods=["PUT"])
+def edit_chat_message(msg_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    user_id = session["user_id"]
+    content = (request.get_json(silent=True) or {}).get("content", "").strip()
+    if not content:
+        return jsonify({"message": "content required"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT sender_id, room_id, is_deleted FROM chat_messages WHERE id=%s", (msg_id,))
+        msg = cur.fetchone()
+        if not msg:
+            return jsonify({"message": "Not found"}), 404
+        if msg["is_deleted"]:
+            return jsonify({"message": "Cannot edit deleted message"}), 400
+        if msg["sender_id"] != user_id:
+            return jsonify({"message": "Can only edit your own messages"}), 403
+
+        cur.execute("UPDATE chat_messages SET content=%s, is_edited=TRUE WHERE id=%s", (content, msg_id))
+        conn.commit()
+
+        socketio.emit("message_edited", {
+            "message_id": msg_id,
+            "content":    content,
+            "room_id":    int(msg["room_id"]),
+        }, room=f"chat_{msg['room_id']}")
+
+        return jsonify({"message": "Edited", "content": content}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── DELETE MESSAGE ────────────────────────────────────────────────────────────
+@app.route("/chat/message/<int:msg_id>", methods=["DELETE"])
+def delete_chat_message(msg_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    user_id     = session["user_id"]
+    is_chairman = session.get("role") == "chairman"
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT sender_id, room_id FROM chat_messages WHERE id=%s", (msg_id,))
+        msg = cur.fetchone()
+        if not msg:
+            return jsonify({"message": "Not found"}), 404
+        if msg["sender_id"] != user_id and not is_chairman:
+            return jsonify({"message": "Access denied"}), 403
+
+        cur.execute(
+            "UPDATE chat_messages SET is_deleted=TRUE, content='', file_url=NULL WHERE id=%s",
+            (msg_id,)
+        )
+        conn.commit()
+
+        socketio.emit("message_deleted", {
+            "message_id": msg_id,
+            "room_id":    int(msg["room_id"]),
+        }, room=f"chat_{msg['room_id']}")
+
+        return jsonify({"message": "Deleted"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── REACT TO MESSAGE ──────────────────────────────────────────────────────────
+@app.route("/chat/message/<int:msg_id>/react", methods=["POST"])
+def react_to_message(msg_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    user_id = session["user_id"]
+    emoji   = (request.get_json(silent=True) or {}).get("emoji", "")
+    VALID   = ["👍","❤️","😂","😮","😢","🙏","🔥","✅","🎉","👏"]
+    if emoji not in VALID:
+        return jsonify({"message": "Invalid emoji"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT room_id FROM chat_messages WHERE id=%s", (msg_id,))
+        msg = cur.fetchone()
+        if not msg:
+            return jsonify({"message": "Not found"}), 404
+
+        cur.execute(
+            "SELECT id FROM chat_message_reactions WHERE message_id=%s AND user_id=%s AND emoji=%s",
+            (msg_id, user_id, emoji)
+        )
+        existing = cur.fetchone()
+        if existing:
+            cur.execute("DELETE FROM chat_message_reactions WHERE id=%s", (existing["id"],))
+        else:
+            cur.execute(
+                "INSERT INTO chat_message_reactions (message_id, user_id, emoji) VALUES (%s,%s,%s) ON CONFLICT DO NOTHING",
+                (msg_id, user_id, emoji)
+            )
+        conn.commit()
+
+        cur.execute("SELECT emoji, user_id FROM chat_message_reactions WHERE message_id=%s", (msg_id,))
+        reactions = [{"emoji": r["emoji"], "user_id": int(r["user_id"])} for r in cur.fetchall()]
+
+        socketio.emit("message_reaction", {
+            "message_id": msg_id,
+            "reactions":  reactions,
+            "room_id":    int(msg["room_id"]),
+        }, room=f"chat_{msg['room_id']}")
+
+        return jsonify({"reactions": reactions}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── CREATE DM ─────────────────────────────────────────────────────────────────
+@app.route("/chat/dm/<target_email>", methods=["POST"])
+def get_or_create_dm(target_email):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    user_id = session["user_id"]
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("SELECT user_id, name FROM users WHERE email=%s", (target_email,))
+        target = cur.fetchone()
+        if not target:
+            return jsonify({"message": "User not found"}), 404
+        target_id = target["user_id"]
+        if target_id == user_id:
+            return jsonify({"message": "Cannot DM yourself"}), 400
+
+        cur.execute("""
+            SELECT r.id FROM chat_rooms r
+            JOIN chat_room_members m1 ON m1.room_id=r.id AND m1.user_id=%s
+            JOIN chat_room_members m2 ON m2.room_id=r.id AND m2.user_id=%s
+            WHERE r.room_type='dm' LIMIT 1
+        """, (user_id, target_id))
+        existing = cur.fetchone()
+        if existing:
+            return jsonify({"room_id": existing["id"]}), 200
+
+        cur.execute("""
+            INSERT INTO chat_rooms (name, room_type, created_by, is_active)
+            VALUES (%s, 'dm', %s, TRUE) RETURNING id
+        """, (f"DM:{user_id}:{target_id}", user_id))
+        room_id = cur.fetchone()["id"]
+
+        execute_values(cur,
+            "INSERT INTO chat_room_members (room_id, user_id) VALUES %s ON CONFLICT DO NOTHING",
+            [(room_id, user_id), (room_id, target_id)]
+        )
+        conn.commit()
+        return jsonify({"room_id": room_id}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── CREATE GROUP (chairman) ───────────────────────────────────────────────────
+@app.route("/chat/room/create", methods=["POST"])
+def create_chat_room():
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+    data       = request.get_json(silent=True) or {}
+    name       = (data.get("name") or "").strip()
+    member_ids = data.get("member_ids", [])
+    if not name:
+        return jsonify({"message": "Room name required"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            INSERT INTO chat_rooms (name, room_type, created_by, is_active)
+            VALUES (%s, 'group', %s, TRUE) RETURNING id
+        """, (name, session["user_id"]))
+        room_id = cur.fetchone()[0]
+
+        all_members = list(set([session["user_id"]] + member_ids))
+        execute_values(cur,
+            "INSERT INTO chat_room_members (room_id, user_id) VALUES %s ON CONFLICT DO NOTHING",
+            [(room_id, uid) for uid in all_members]
+        )
+        conn.commit()
+        return jsonify({"room_id": room_id, "message": "Group created"}), 201
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── DELETE ROOM (chairman) ────────────────────────────────────────────────────
+@app.route("/chat/room/<int:room_id>", methods=["DELETE"])
+def delete_chat_room(room_id):
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT id FROM chat_rooms WHERE id=%s", (room_id,))
+        if not cur.fetchone():
+            return jsonify({"message": "Room not found"}), 404
+        cur.execute("DELETE FROM chat_rooms WHERE id=%s", (room_id,))
+        conn.commit()
+        socketio.emit("room_deleted", {"room_id": room_id})
+        return jsonify({"message": "Room deleted"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── MANAGE ROOM MEMBERS ───────────────────────────────────────────────────────
+@app.route("/chat/room/<int:room_id>/members", methods=["GET", "POST", "DELETE"])
+def manage_room_members(room_id):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        if request.method == "GET":
+            cur.execute("""
+                SELECT u.user_id, u.name, u.email, u.role, u.department, u.image
+                FROM users u
+                JOIN chat_room_members m ON m.user_id=u.user_id
+                WHERE m.room_id=%s ORDER BY u.name
+            """, (room_id,))
+            return jsonify([dict(r) for r in cur.fetchall()]), 200
+
+        if session.get("role") != "chairman":
+            return jsonify({"message": "Chairman only"}), 403
+
+        data   = request.get_json(silent=True) or {}
+        target = data.get("user_id")
+        if not target:
+            return jsonify({"message": "user_id required"}), 400
+
+        if request.method == "POST":
+            cur.execute(
+                "INSERT INTO chat_room_members (room_id, user_id) VALUES (%s,%s) ON CONFLICT DO NOTHING",
+                (room_id, target)
+            )
+            socketio.emit("member_added",   {"room_id": room_id}, room=f"chat_{room_id}")
+        else:
+            cur.execute(
+                "DELETE FROM chat_room_members WHERE room_id=%s AND user_id=%s",
+                (room_id, target)
+            )
+            socketio.emit("member_removed", {"room_id": room_id}, room=f"chat_{room_id}")
+
+        conn.commit()
+        return jsonify({"message": "Done"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── MARK MESSAGES READ ────────────────────────────────────────────────────────
+@app.route("/chat/mark-read", methods=["POST"])
+def mark_messages_read():
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    user_id     = session["user_id"]
+    message_ids = (request.get_json(silent=True) or {}).get("message_ids", [])
+    if not message_ids:
+        return jsonify({"message": "No message_ids"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        execute_values(cur,
+            "INSERT INTO chat_message_reads (message_id, user_id) VALUES %s ON CONFLICT DO NOTHING",
+            [(mid, user_id) for mid in message_ids]
+        )
+        conn.commit()
+        return jsonify({"message": "Marked read"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── ADMIN: ALL ROOMS (chairman) ───────────────────────────────────────────────
+@app.route("/chat/admin/all-rooms", methods=["GET"])
+def admin_all_rooms():
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+    user_id = session["user_id"]
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            SELECT r.id, r.name, r.room_type, r.department,
+                   (SELECT content FROM chat_messages
+                    WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
+                    ORDER BY created_at DESC LIMIT 1) AS last_message,
+                   (SELECT created_at FROM chat_messages
+                    WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
+                   (SELECT COUNT(*) FROM chat_messages m
+                    WHERE m.room_id=r.id AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
+                    AND NOT EXISTS (
+                        SELECT 1 FROM chat_message_reads rd
+                        WHERE rd.message_id=m.id AND rd.user_id=%s
+                    )) AS unread_count,
+                   (SELECT COUNT(*) FROM chat_room_members WHERE room_id=r.id) AS member_count
+            FROM chat_rooms r
+            WHERE r.is_active=TRUE OR r.is_active IS NULL
+            ORDER BY last_message_at DESC NULLS LAST, r.name
+        """, (user_id,))
+
+        rooms = []
+        for r in cur.fetchall():
+            row = dict(r)
+            row["last_message_at"] = row["last_message_at"].isoformat() if row["last_message_at"] else None
+            row["unread_count"]    = int(row["unread_count"] or 0)
+            row["member_count"]    = int(row["member_count"] or 0)
+            if row["room_type"] == "dm":
+                cur.execute("""
+                    SELECT u.name FROM users u
+                    JOIN chat_room_members rm ON rm.user_id=u.user_id
+                    WHERE rm.room_id=%s AND u.user_id != %s LIMIT 1
+                """, (row["id"], user_id))
+                other = cur.fetchone()
+                if other:
+                    row["name"] = other["name"]
+            rooms.append(row)
+        return jsonify(rooms), 200
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── SECTION ACCESS CONTROL ────────────────────────────────────────────────────
+AVAILABLE_SECTIONS = ["attendance","leave","salary","sales","leads","chat","fulldata","chatlogs"]
+
+@app.route("/chat/access/set", methods=["POST"])
+def set_employee_access():
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+    data         = request.get_json(silent=True) or {}
+    target_email = data.get("email")
+    sections     = [s for s in data.get("sections", []) if s in AVAILABLE_SECTIONS]
+    if not target_email:
+        return jsonify({"message": "email required"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE email=%s", (target_email,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"message": "User not found"}), 404
+        cur.execute("""
+            INSERT INTO employee_section_access (user_id, sections, updated_at)
+            VALUES (%s, %s::jsonb, NOW())
+            ON CONFLICT (user_id) DO UPDATE SET sections=%s::jsonb, updated_at=NOW()
+        """, (user[0], json.dumps(sections), json.dumps(sections)))
+        conn.commit()
+        return jsonify({"message": "Access updated", "sections": sections}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+@app.route("/chat/access/get/<email>", methods=["GET"])
+def get_employee_access(email):
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT user_id FROM users WHERE email=%s", (email,))
+        user = cur.fetchone()
+        if not user:
+            return jsonify({"sections": AVAILABLE_SECTIONS}), 200
+        cur.execute("SELECT sections FROM employee_section_access WHERE user_id=%s", (user[0],))
+        row      = cur.fetchone()
+        sections = row[0] if row else AVAILABLE_SECTIONS
+        if isinstance(sections, str):
+            sections = json.loads(sections)
+        return jsonify({"sections": sections}), 200
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── SOCKET.IO CHAT EVENTS ─────────────────────────────────────────────────────
+# include_self=False is VALID here — these are socket event handlers
+# where request.sid exists. Do NOT use include_self=False in HTTP routes.
+
+@socketio.on("join_chat_room")
+def handle_join_chat_room(data):
+    from flask_socketio import join_room
+    room_id = data.get("room_id")
+    if room_id:
+        join_room(f"chat_{room_id}")
+        emit("joined_room", {"room_id": room_id})
+
+@socketio.on("leave_chat_room")
+def handle_leave_chat_room(data):
+    from flask_socketio import leave_room
+    room_id = data.get("room_id")
+    if room_id:
+        leave_room(f"chat_{room_id}")
+
+@socketio.on("typing")
+def handle_typing(data):
+    room_id = data.get("room_id")
+    if room_id:
+        emit("typing_indicator", {
+            "room_id":   room_id,
+            "user_name": data.get("user_name", ""),
+            "is_typing": data.get("is_typing", False),
+        }, room=f"chat_{room_id}", include_self=False)
+
+@socketio.on("message_edited")
+def handle_message_edited(data):
+    room_id = data.get("room_id")
+    if room_id:
+        emit("message_edited", data, room=f"chat_{room_id}", include_self=False)
+
+@socketio.on("message_deleted")
+def handle_message_deleted(data):
+    room_id = data.get("room_id")
+    if room_id:
+        emit("message_deleted", data, room=f"chat_{room_id}", include_self=False)
+
+@socketio.on("message_reaction")
+def handle_message_reaction(data):
+    room_id = data.get("room_id")
+    if room_id:
+        emit("message_reaction", data, room=f"chat_{room_id}", include_self=False)
+
+@socketio.on("user_online")
+def handle_user_online(data):
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    _online_users[user_id].add(request.sid)
+    all_online = [uid for uid, sids in _online_users.items() if sids]
+    emit("online_users", all_online, broadcast=True)
+    emit("user_came_online", {"user_id": user_id}, broadcast=True, include_self=False)
+
+@socketio.on("user_offline")
+def handle_user_offline(data):
+    user_id = data.get("user_id")
+    if not user_id:
+        return
+    _online_users[user_id].discard(request.sid)
+    if not _online_users[user_id]:
+        del _online_users[user_id]
+        emit("user_went_offline", {"user_id": user_id}, broadcast=True, include_self=False)
+
+@socketio.on("disconnect")
+def handle_chat_disconnect():
+    disconnected_user = None
+    for user_id, sids in list(_online_users.items()):
+        if request.sid in sids:
+            sids.discard(request.sid)
+            if not sids:
+                del _online_users[user_id]
+                disconnected_user = user_id
+            break
+    if disconnected_user:
+        emit("user_went_offline", {"user_id": disconnected_user}, broadcast=True)
+    print(f"❌ Client disconnected: {request.sid}")
+
+@socketio.on("messages_read")
+def handle_messages_read(data):
+    room_id     = data.get("room_id")
+    reader_id   = data.get("reader_id")
+    message_ids = data.get("message_ids", [])
+    if room_id and reader_id and message_ids:
+        emit("messages_read", {
+            "reader_id":   reader_id,
+            "message_ids": message_ids,
+        }, room=f"chat_{room_id}", include_self=False)
+
+# ==================== END CHAT ROUTES ====================
 if __name__ == "__main__":
     socketio.run(
         app,
