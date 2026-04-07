@@ -19,7 +19,7 @@ import psycopg2
 from psycopg2 import pool
 from psycopg2.extras import RealDictCursor
 from openpyxl import Workbook
-
+from contextlib import contextmanager
 # ==================== CONFIGURATION ====================
 load_dotenv()
 
@@ -58,25 +58,42 @@ for folder in [UPLOAD_FOLDER, PROFILE_UPLOAD_FOLDER, OFFER_LETTER_FOLDER, SALARY
 # CRITICAL OPTIMIZATION: Use connection pooling instead of creating new connections
 connection_pool = None
 
+
 def init_connection_pool():
-    """Initialize database connection pool - REDUCES CPU by 40-60%"""
     global connection_pool
     try:
         connection_pool = psycopg2.pool.ThreadedConnectionPool(
-            minconn=2,  # Minimum connections
-            maxconn=10,  # Maximum connections (adjust based on your VPS resources)
+            minconn=5,
+            maxconn=25,          # was 10 — bumped to survive traffic spikes
             host=os.getenv("DB_HOST", "localhost"),
             database=os.getenv("DB_NAME", "hrm_db"),
             user=os.getenv("DB_USER", "postgres"),
             password=os.getenv("DB_PASSWORD"),
             port=os.getenv("DB_PORT", "5432"),
-            connect_timeout=5,  # Timeout after 5 seconds
-            options="-c statement_timeout=30000"  # 30 second query timeout
+            connect_timeout=5,
+            options="-c statement_timeout=30000"
         )
         print("✅ Database connection pool initialized")
     except Exception as e:
         print(f"❌ Failed to initialize connection pool: {e}")
         raise
+
+@contextmanager
+def get_db():
+    """
+    ALWAYS returns the connection to the pool — even on exception or early return.
+    Use instead of manual get_db_connection / put_db_connection.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        yield conn, cur
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        cur.close()
+        put_db_connection(conn)
 
 def get_db_connection():
     """Get connection from pool"""
@@ -278,71 +295,55 @@ def register():
 def me():
     if "user_id" not in session:
         return jsonify({"message": "Unauthorized"}), 401
-
-    conn = get_db_connection()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        # Fetch user profile
-        cur.execute("""
-            SELECT user_id, name, email, role, image, offer_letter_url, location,
-                   employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code,
-                   department, paid_leaves
-            FROM users
-            WHERE user_id = %s
-        """, (session["user_id"],))
-        user = cur.fetchone()
+        with get_db() as (conn, cur):
+            cur.execute("""
+                SELECT user_id, name, email, role, image, offer_letter_url, location,
+                       employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code,
+                       department, paid_leaves
+                FROM users WHERE user_id = %s
+            """, (session["user_id"],))
+            user = cur.fetchone()
+            if not user:
+                return jsonify({"message": "User not found"}), 404
 
-        if not user:
-            return jsonify({"message": "User not found"}), 404
-
-        # ── Fetch visible sections (set by chairman via /chat/access/set) ──
-        DEFAULT_SECTIONS = ["attendance", "leave", "salary", "chat"]
-
-        cur.execute(
-            "SELECT sections FROM employee_section_access WHERE user_id = %s",
-            (session["user_id"],)
-        )
-        access_row = cur.fetchone()
-
-        if access_row and access_row["sections"]:
-            sections = access_row["sections"]
-            # Normalise: psycopg2 returns JSONB as a Python object already
-            if isinstance(sections, str):
-                import json as _json
-                sections = _json.loads(sections)
-        else:
-            # No row yet → use defaults (chairman always sees everything)
-            if user["role"] == "chairman":
-                sections = ["attendance","leave","salary","chat","leads","sales","chatlogs","fulldata"]
+            DEFAULT_SECTIONS = ["attendance", "leave", "salary", "chat"]
+            cur.execute(
+                "SELECT sections FROM employee_section_access WHERE user_id = %s",
+                (session["user_id"],)
+            )
+            access_row = cur.fetchone()
+            if access_row and access_row["sections"]:
+                sections = access_row["sections"]
+                if isinstance(sections, str):
+                    sections = json.loads(sections)
             else:
-                sections = DEFAULT_SECTIONS
+                if user["role"] == "chairman":
+                    sections = ["attendance","leave","salary","chat","leads","sales","chatlogs","fulldata"]
+                else:
+                    sections = DEFAULT_SECTIONS
 
-        return jsonify({
-            "id":              user["user_id"],
-            "name":            user["name"],
-            "email":           user["email"],
-            "role":            user["role"],
-            "image":           user["image"],
-            "offer_letter_url":user["offer_letter_url"],
-            "location":        user["location"],
-            "employeeId":      user["employee_id"],
-            "salary":          float(user["salary"]) if user["salary"] else None,
-            "bankAccount":     user["bank_account"],
-            "dob":             user["dob"].isoformat()  if user["dob"]  else None,
-            "doj":             user["doj"].isoformat()  if user["doj"]  else None,
-            "panNo":           user["pan_no"],
-            "ifscCode":        user["ifsc_code"],
-            "department":      user["department"],
-            "paidLeaves":      user["paid_leaves"] if user["paid_leaves"] is not None else 0,
-            # ✅ NEW — consumed by EmployeeDashboard on mount
-            "visibleSections": sections,
-        }), 200
-
+            return jsonify({
+                "id":               user["user_id"],
+                "name":             user["name"],
+                "email":            user["email"],
+                "role":             user["role"],
+                "image":            user["image"],
+                "offer_letter_url": user["offer_letter_url"],
+                "location":         user["location"],
+                "employeeId":       user["employee_id"],
+                "salary":           float(user["salary"]) if user["salary"] else None,
+                "bankAccount":      user["bank_account"],
+                "dob":              user["dob"].isoformat()  if user["dob"]  else None,
+                "doj":              user["doj"].isoformat()  if user["doj"]  else None,
+                "panNo":            user["pan_no"],
+                "ifscCode":         user["ifsc_code"],
+                "department":       user["department"],
+                "paidLeaves":       user["paid_leaves"] if user["paid_leaves"] is not None else 0,
+                "visibleSections":  sections,
+            }), 200
     except Exception as e:
         return jsonify({"message": str(e)}), 500
-    finally:
-        cur.close()
-        put_db_connection(conn)
 
 
 # ── PATCH 2: Add /all-employees route ─────────────────────────────────────────
@@ -3710,90 +3711,80 @@ def get_chat_rooms():
         return jsonify({"message": "Unauthorized"}), 401
     user_id = session["user_id"]
     role    = session.get("role", "")
-    conn = get_db_connection()
-    cur  = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        if role == "chairman":
-               cur.execute("""
-        SELECT r.id, r.name, r.room_type, r.department,
-               (SELECT content FROM chat_messages
-                WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
-                ORDER BY created_at DESC LIMIT 1) AS last_message,
-               (SELECT file_name FROM chat_messages
-                WHERE room_id=r.id AND file_name IS NOT NULL
-                ORDER BY created_at DESC LIMIT 1) AS last_file_name,
-               (SELECT created_at FROM chat_messages
-                WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
-               (SELECT COUNT(*) FROM chat_messages m
-                WHERE m.room_id=r.id
-                  AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
-                  AND NOT EXISTS (
-                      SELECT 1 FROM chat_message_reads rd
-                      WHERE rd.message_id=m.id AND rd.user_id=%s
-                  )) AS unread_count
-        FROM chat_rooms r
-        WHERE (r.is_active=TRUE OR r.is_active IS NULL)
-          AND (
-            r.room_type != 'dm'
-            OR EXISTS (
-                SELECT 1 FROM chat_room_members cm
-                WHERE cm.room_id = r.id AND cm.user_id = %s
-            )
-          )
-        ORDER BY last_message_at DESC NULLS LAST, r.name
-          """, (user_id, user_id))
-        else:
-            cur.execute("""
-                SELECT r.id, r.name, r.room_type, r.department,
-                       (SELECT content FROM chat_messages
-                        WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
-                        ORDER BY created_at DESC LIMIT 1) AS last_message,
-                       (SELECT file_name FROM chat_messages
-                        WHERE room_id=r.id AND file_name IS NOT NULL
-                        ORDER BY created_at DESC LIMIT 1) AS last_file_name,
-                       (SELECT created_at FROM chat_messages
-                        WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
-                       (SELECT COUNT(*) FROM chat_messages m
-                        WHERE m.room_id=r.id
-                          AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
-                          AND NOT EXISTS (
-                              SELECT 1 FROM chat_message_reads rd
-                              WHERE rd.message_id=m.id AND rd.user_id=%s
-                          )) AS unread_count
-                FROM chat_rooms r
-                JOIN chat_room_members rm ON rm.room_id=r.id AND rm.user_id=%s
-                WHERE r.is_active=TRUE OR r.is_active IS NULL
-                ORDER BY last_message_at DESC NULLS LAST, r.name
-            """, (user_id, user_id))
-
-        rooms = []
-        for r in cur.fetchall():
-            row = dict(r)
-            row["last_message_at"] = row["last_message_at"].isoformat() if row["last_message_at"] else None
-            row["unread_count"]    = int(row["unread_count"] or 0)
-
-            # FIX: sidebar preview — show file name if no text content
-            if not row.get("last_message") and row.get("last_file_name"):
-                row["last_message"] = f"📎 {row['last_file_name']}"
-            row.pop("last_file_name", None)
-
-            if row["room_type"] == "dm":
+        with get_db() as (conn, cur):
+            if role == "chairman":
                 cur.execute("""
-                    SELECT u.name, u.image FROM users u
-                    JOIN chat_room_members rm ON rm.user_id=u.user_id
-                    WHERE rm.room_id=%s AND u.user_id != %s LIMIT 1
-                """, (row["id"], user_id))
-                other = cur.fetchone()
-                if other:
-                    row["name"]     = other["name"]
-                    row["dm_image"] = other["image"]
-            rooms.append(row)
-        return jsonify(rooms), 200
+                    SELECT r.id, r.name, r.room_type, r.department,
+                           (SELECT content FROM chat_messages
+                            WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
+                            ORDER BY created_at DESC LIMIT 1) AS last_message,
+                           (SELECT file_name FROM chat_messages
+                            WHERE room_id=r.id AND file_name IS NOT NULL
+                            ORDER BY created_at DESC LIMIT 1) AS last_file_name,
+                           (SELECT created_at FROM chat_messages
+                            WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
+                           (SELECT COUNT(*) FROM chat_messages m
+                            WHERE m.room_id=r.id
+                              AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM chat_message_reads rd
+                                  WHERE rd.message_id=m.id AND rd.user_id=%s
+                              )) AS unread_count
+                    FROM chat_rooms r
+                    WHERE (r.is_active=TRUE OR r.is_active IS NULL)
+                      AND (r.room_type != 'dm' OR EXISTS (
+                          SELECT 1 FROM chat_room_members cm
+                          WHERE cm.room_id = r.id AND cm.user_id = %s
+                      ))
+                    ORDER BY last_message_at DESC NULLS LAST, r.name
+                """, (user_id, user_id))
+            else:
+                cur.execute("""
+                    SELECT r.id, r.name, r.room_type, r.department,
+                           (SELECT content FROM chat_messages
+                            WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
+                            ORDER BY created_at DESC LIMIT 1) AS last_message,
+                           (SELECT file_name FROM chat_messages
+                            WHERE room_id=r.id AND file_name IS NOT NULL
+                            ORDER BY created_at DESC LIMIT 1) AS last_file_name,
+                           (SELECT created_at FROM chat_messages
+                            WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
+                           (SELECT COUNT(*) FROM chat_messages m
+                            WHERE m.room_id=r.id
+                              AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM chat_message_reads rd
+                                  WHERE rd.message_id=m.id AND rd.user_id=%s
+                              )) AS unread_count
+                    FROM chat_rooms r
+                    JOIN chat_room_members rm ON rm.room_id=r.id AND rm.user_id=%s
+                    WHERE r.is_active=TRUE OR r.is_active IS NULL
+                    ORDER BY last_message_at DESC NULLS LAST, r.name
+                """, (user_id, user_id))
+
+            rooms = []
+            for r in cur.fetchall():
+                row = dict(r)
+                row["last_message_at"] = row["last_message_at"].isoformat() if row["last_message_at"] else None
+                row["unread_count"]    = int(row["unread_count"] or 0)
+                if not row.get("last_message") and row.get("last_file_name"):
+                    row["last_message"] = f"📎 {row['last_file_name']}"
+                row.pop("last_file_name", None)
+                if row["room_type"] == "dm":
+                    cur.execute("""
+                        SELECT u.name, u.image FROM users u
+                        JOIN chat_room_members rm ON rm.user_id=u.user_id
+                        WHERE rm.room_id=%s AND u.user_id != %s LIMIT 1
+                    """, (row["id"], user_id))
+                    other = cur.fetchone()
+                    if other:
+                        row["name"]     = other["name"]
+                        row["dm_image"] = other["image"]
+                rooms.append(row)
+            return jsonify(rooms), 200
     except Exception as e:
         return jsonify({"message": str(e)}), 500
-    finally:
-        cur.close()
-        put_db_connection(conn)
 
 @app.route("/chat/room/<int:room_id>/rename", methods=["PUT"])
 def rename_chat_room(room_id):
