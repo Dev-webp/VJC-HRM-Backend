@@ -262,72 +262,332 @@ def register():
         put_db_connection(conn)
 
 # ==================== PROFILE ROUTES ====================
+# ==================== BACKEND PATCHES FOR EMPLOYEE ACCESS PANEL ====================
+# Add / replace these two routes in your app.py
+# No new tables needed — uses the existing `employee_section_access` table
+# ==================================================================================
+
+# ── PATCH 1: Replace your existing /me route ──────────────────────────────────
+# This version ALSO returns visibleSections so EmployeeDashboard
+# can call canSeeSection() correctly on load.
+#
+# The employee_section_access table already exists (created by your chat routes).
+# Schema: (user_id INT PK, sections JSONB, updated_at TIMESTAMPTZ)
+
 @app.route("/me", methods=["GET"])
 def me():
     if "user_id" not in session:
         return jsonify({"message": "Unauthorized"}), 401
 
     conn = get_db_connection()
-    cur = conn.cursor(cursor_factory=RealDictCursor)
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     try:
+        # Fetch user profile
         cur.execute("""
             SELECT user_id, name, email, role, image, offer_letter_url, location,
-                   employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code, 
+                   employee_id, salary, bank_account, dob, doj, pan_no, ifsc_code,
                    department, paid_leaves
             FROM users
             WHERE user_id = %s
         """, (session["user_id"],))
         user = cur.fetchone()
-        
+
         if not user:
             return jsonify({"message": "User not found"}), 404
 
+        # ── Fetch visible sections (set by chairman via /chat/access/set) ──
+        DEFAULT_SECTIONS = ["attendance", "leave", "salary", "chat"]
+
+        cur.execute(
+            "SELECT sections FROM employee_section_access WHERE user_id = %s",
+            (session["user_id"],)
+        )
+        access_row = cur.fetchone()
+
+        if access_row and access_row["sections"]:
+            sections = access_row["sections"]
+            # Normalise: psycopg2 returns JSONB as a Python object already
+            if isinstance(sections, str):
+                import json as _json
+                sections = _json.loads(sections)
+        else:
+            # No row yet → use defaults (chairman always sees everything)
+            if user["role"] == "chairman":
+                sections = ["attendance","leave","salary","chat","leads","sales","chatlogs","fulldata"]
+            else:
+                sections = DEFAULT_SECTIONS
+
         return jsonify({
-            "id": user["user_id"],
-            "name": user["name"],
-            "email": user["email"],
-            "role": user["role"],
-            "image": user["image"],
-            "offer_letter_url": user["offer_letter_url"],
-            "location": user["location"],
-            "employeeId": user["employee_id"],
-            "salary": float(user["salary"]) if user["salary"] else None,
-            "bankAccount": user["bank_account"],
-            "dob": user["dob"].isoformat() if user["dob"] else None,
-            "doj": user["doj"].isoformat() if user["doj"] else None,
-            "panNo": user["pan_no"],
-            "ifscCode": user["ifsc_code"],
-            "department": user["department"],
-            "paidLeaves": user["paid_leaves"] if user["paid_leaves"] is not None else 0
+            "id":              user["user_id"],
+            "name":            user["name"],
+            "email":           user["email"],
+            "role":            user["role"],
+            "image":           user["image"],
+            "offer_letter_url":user["offer_letter_url"],
+            "location":        user["location"],
+            "employeeId":      user["employee_id"],
+            "salary":          float(user["salary"]) if user["salary"] else None,
+            "bankAccount":     user["bank_account"],
+            "dob":             user["dob"].isoformat()  if user["dob"]  else None,
+            "doj":             user["doj"].isoformat()  if user["doj"]  else None,
+            "panNo":           user["pan_no"],
+            "ifscCode":        user["ifsc_code"],
+            "department":      user["department"],
+            "paidLeaves":      user["paid_leaves"] if user["paid_leaves"] is not None else 0,
+            # ✅ NEW — consumed by EmployeeDashboard on mount
+            "visibleSections": sections,
         }), 200
+
     except Exception as e:
         return jsonify({"message": str(e)}), 500
     finally:
         cur.close()
         put_db_connection(conn)
 
-@app.route("/update-profile-name", methods=["POST"])
-def update_profile_name():
-    if "user_id" not in session:
-        return jsonify({"message": "Not logged in"}), 401
 
-    new_name = request.form.get("name")
-    if not new_name:
-        return jsonify({"message": "Name required"}), 400
+# ── PATCH 2: Add /all-employees route ─────────────────────────────────────────
+# ChairmanAccessPanel fetches this to list all employees.
+# Returns id, name, email, role, department, location for every active user.
+# (Chairman-only route)
+
+@app.route("/all-employees", methods=["GET"])
+def all_employees():
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
 
     conn = get_db_connection()
-    cur = conn.cursor()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
     try:
-        cur.execute(
-            "UPDATE users SET name = %s WHERE user_id = %s", 
-            (new_name, session["user_id"])
-        )
-        conn.commit()
-        return jsonify({"message": "Name updated"}), 200
+        cur.execute("""
+            SELECT user_id AS id, name, email, role, department, location
+            FROM users
+            WHERE is_active = TRUE
+              AND role != 'chairman'
+            ORDER BY name ASC
+        """)
+        employees = [dict(r) for r in cur.fetchall()]
+        return jsonify(employees), 200
+
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+# ==================== DEPARTMENTS ROUTES ====================
+# Add these routes to your app.py
+# Run the SQL migration below ONCE before deploying.
+#
+# ─── SQL MIGRATION (run once) ──────────────────────────────────────────────────
+#
+#   CREATE TABLE IF NOT EXISTS custom_departments (
+#     id         SERIAL PRIMARY KEY,
+#     name       TEXT UNIQUE NOT NULL,
+#     locations  JSONB DEFAULT '[]'::jsonb,
+#     created_by INT REFERENCES users(user_id),
+#     created_at TIMESTAMPTZ DEFAULT NOW()
+#   );
+#
+# ───────────────────────────────────────────────────────────────────────────────
+
+# List of built-in departments (always returned regardless of DB)
+BUILTIN_DEPARTMENTS = [
+    # Leadership
+    "CEO",
+    "Director",
+    "Branch Manager",
+
+    # Team Managers — Sales
+    "Team Manager Sales-Immigration",
+    "Team Manager Sales-Study",
+    "Team Manager Sales-Visit",
+
+    # Team Managers — Process
+    "Team Manager Process-Immigration",
+    "Team Manager Process-Study",
+    "Team Manager Process-Visit",
+
+    # Sales Executives
+    "Sales-Immigration",
+    "Sales-Study",
+    "Sales-Visit",
+
+    # Process Executives
+    "Process-Immigration",
+    "Process-Study",
+    "Process-Visit/RMS",
+
+    # Support
+    "Digital Marketing",
+    "MIS",
+    "Developers-IT",
+    "Reception-Hyd/Bgl",
+]
+
+
+@app.route("/departments", methods=["GET"])
+def get_departments():
+    """
+    Returns all custom departments stored in the DB.
+    The frontend merges these with its own BUILTIN_DEPARTMENTS list.
+    Any authenticated user can fetch this list.
+    """
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            SELECT id, name, locations, created_at
+            FROM custom_departments
+            ORDER BY created_at ASC
+        """)
+        rows = cur.fetchall()
+        result = []
+        for r in rows:
+            result.append({
+                "id":         r["id"],
+                "name":       r["name"],
+                "locations":  r["locations"] if r["locations"] else [],
+                "created_at": r["created_at"].isoformat() if r["created_at"] else None,
+                "isCustom":   True,
+            })
+        return jsonify(result), 200
+
+    except Exception as e:
+        return jsonify({"message": str(e)}), 500
     finally:
         cur.close()
         put_db_connection(conn)
 
+
+@app.route("/departments", methods=["POST"])
+def add_department():
+    """
+    Chairman-only: Add a new custom department.
+    Body JSON: { "name": "New Department Name", "locations": ["Hyderabad"] }
+    """
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+
+    data      = request.get_json(silent=True) or {}
+    name      = (data.get("name") or "").strip()
+    locations = data.get("locations", [])
+
+    if not name:
+        return jsonify({"message": "Department name is required"}), 400
+
+    # Reject if it conflicts with a built-in
+    if name in BUILTIN_DEPARTMENTS:
+        return jsonify({"message": "This department already exists as a built-in department"}), 409
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        cur.execute("""
+            INSERT INTO custom_departments (name, locations, created_by)
+            VALUES (%s, %s::jsonb, %s)
+            ON CONFLICT (name) DO NOTHING
+            RETURNING id, name, locations, created_at
+        """, (name, json.dumps(locations), session["user_id"]))
+
+        row = cur.fetchone()
+        conn.commit()
+
+        if not row:
+            # Already existed — return existing row
+            cur.execute("SELECT id, name, locations, created_at FROM custom_departments WHERE name = %s", (name,))
+            row = cur.fetchone()
+
+        return jsonify({
+            "id":         row["id"],
+            "name":       row["name"],
+            "locations":  row["locations"] if row["locations"] else [],
+            "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+            "isCustom":   True,
+        }), 201
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+@app.route("/departments/<int:dept_id>", methods=["DELETE"])
+def delete_department(dept_id):
+    """
+    Chairman-only: Delete a custom department by ID.
+    Built-in departments cannot be deleted (they don't exist in DB).
+    """
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("DELETE FROM custom_departments WHERE id = %s RETURNING name", (dept_id,))
+        deleted = cur.fetchone()
+        if not deleted:
+            return jsonify({"message": "Department not found"}), 404
+
+        conn.commit()
+        return jsonify({"message": f"Department '{deleted[0]}' deleted"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+@app.route("/departments/<int:dept_id>", methods=["PUT"])
+def update_department(dept_id):
+    """
+    Chairman-only: Rename or update locations for a custom department.
+    Body JSON: { "name": "...", "locations": ["..."] }
+    """
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+
+    data      = request.get_json(silent=True) or {}
+    name      = (data.get("name") or "").strip()
+    locations = data.get("locations", [])
+
+    if not name:
+        return jsonify({"message": "Name required"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("""
+            UPDATE custom_departments
+            SET name = %s, locations = %s::jsonb
+            WHERE id = %s
+            RETURNING id
+        """, (name, json.dumps(locations), dept_id))
+
+        if not cur.fetchone():
+            return jsonify({"message": "Department not found"}), 404
+
+        conn.commit()
+        return jsonify({"message": "Department updated"}), 200
+
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+# ==================== END DEPARTMENTS ROUTES ====================
+
+# ==================== END OF BACKEND PATCHES ====================
+# The /chat/access/set and /chat/access/get routes you already have
+# are the save/load endpoints used by ChairmanAccessPanel.
+# No changes needed there — they already write to employee_section_access.
 @app.route("/update-password", methods=["POST"])
 def update_password():
     if "user_id" not in session:
@@ -3454,27 +3714,34 @@ def get_chat_rooms():
     cur  = conn.cursor(cursor_factory=RealDictCursor)
     try:
         if role == "chairman":
-            cur.execute("""
-                SELECT r.id, r.name, r.room_type, r.department,
-                       (SELECT content FROM chat_messages
-                        WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
-                        ORDER BY created_at DESC LIMIT 1) AS last_message,
-                       (SELECT file_name FROM chat_messages
-                        WHERE room_id=r.id AND file_name IS NOT NULL
-                        ORDER BY created_at DESC LIMIT 1) AS last_file_name,
-                       (SELECT created_at FROM chat_messages
-                        WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
-                       (SELECT COUNT(*) FROM chat_messages m
-                        WHERE m.room_id=r.id
-                          AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
-                          AND NOT EXISTS (
-                              SELECT 1 FROM chat_message_reads rd
-                              WHERE rd.message_id=m.id AND rd.user_id=%s
-                          )) AS unread_count
-                FROM chat_rooms r
-                WHERE r.is_active=TRUE OR r.is_active IS NULL
-                ORDER BY last_message_at DESC NULLS LAST, r.name
-            """, (user_id,))
+               cur.execute("""
+        SELECT r.id, r.name, r.room_type, r.department,
+               (SELECT content FROM chat_messages
+                WHERE room_id=r.id AND (is_deleted IS NULL OR is_deleted=FALSE)
+                ORDER BY created_at DESC LIMIT 1) AS last_message,
+               (SELECT file_name FROM chat_messages
+                WHERE room_id=r.id AND file_name IS NOT NULL
+                ORDER BY created_at DESC LIMIT 1) AS last_file_name,
+               (SELECT created_at FROM chat_messages
+                WHERE room_id=r.id ORDER BY created_at DESC LIMIT 1) AS last_message_at,
+               (SELECT COUNT(*) FROM chat_messages m
+                WHERE m.room_id=r.id
+                  AND (m.is_deleted IS NULL OR m.is_deleted=FALSE)
+                  AND NOT EXISTS (
+                      SELECT 1 FROM chat_message_reads rd
+                      WHERE rd.message_id=m.id AND rd.user_id=%s
+                  )) AS unread_count
+        FROM chat_rooms r
+        WHERE (r.is_active=TRUE OR r.is_active IS NULL)
+          AND (
+            r.room_type != 'dm'
+            OR EXISTS (
+                SELECT 1 FROM chat_room_members cm
+                WHERE cm.room_id = r.id AND cm.user_id = %s
+            )
+          )
+        ORDER BY last_message_at DESC NULLS LAST, r.name
+          """, (user_id, user_id))
         else:
             cur.execute("""
                 SELECT r.id, r.name, r.room_type, r.department,
@@ -3528,7 +3795,39 @@ def get_chat_rooms():
         cur.close()
         put_db_connection(conn)
 
-
+@app.route("/chat/room/<int:room_id>/rename", methods=["PUT"])
+def rename_chat_room(room_id):
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+ 
+    data = request.get_json(silent=True) or {}
+    new_name = (data.get("name") or "").strip()
+ 
+    if not new_name:
+        return jsonify({"message": "Name required"}), 400
+ 
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("SELECT id, room_type FROM chat_rooms WHERE id=%s", (room_id,))
+        room = cur.fetchone()
+        if not room:
+            return jsonify({"message": "Room not found"}), 404
+        if room[1] == "dm":
+            return jsonify({"message": "Cannot rename DMs"}), 400
+ 
+        cur.execute("UPDATE chat_rooms SET name=%s WHERE id=%s", (new_name, room_id))
+        conn.commit()
+ 
+        socketio.emit("room_renamed", {"room_id": room_id, "name": new_name}, room=f"chat_{room_id}")
+        return jsonify({"message": "Renamed", "name": new_name}), 200
+ 
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
 # ── GET MESSAGES ──────────────────────────────────────────────────────────────
 @app.route("/chat/room/<int:room_id>/messages", methods=["GET"])
 def get_room_messages(room_id):
