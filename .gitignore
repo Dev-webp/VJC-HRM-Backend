@@ -1,0 +1,7 @@
+DB_HOST=localhost
+DB_NAME=users
+DB_USER=postgres
+DB_PASSWORD=postgres
+DB_PORT=5432
+FLASK_SECRET=some-very-secret-key
+GEMINI_API_KEY=AIzaSyBAgFwI1SLGdq3zPGpGyXD6pKFlaHOoebc
