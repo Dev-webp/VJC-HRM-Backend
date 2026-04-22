@@ -4683,7 +4683,267 @@ def groq_proxy():
 
     return jsonify({"message": "Failed after retries. Try again shortly."}), 429
 
+# ==================== RESUME MARKETING ROUTES ====================
+# Add these routes to your app.py
+# Run SQL migration once before deploying (see below)
+#
+# ─── SQL MIGRATION (run once) ──────────────────────────────────────────────────
+#
+#   CREATE TABLE IF NOT EXISTS resume_usage_logs (
+#     id              SERIAL PRIMARY KEY,
+#     user_id         INT REFERENCES users(user_id),
+#     employee_name   TEXT,
+#     action          TEXT NOT NULL,  -- 'generate' | 'jd_analysis' | 'jd_rebuild'
+#     candidate_name  TEXT,
+#     country         TEXT,
+#     template_name   TEXT,
+#     file_name       TEXT,
+#     match_score     INT,
+#     match_label     TEXT,
+#     created_at      TIMESTAMPTZ DEFAULT NOW()
+#   );
+#
+#   CREATE INDEX idx_resume_logs_user   ON resume_usage_logs(user_id);
+#   CREATE INDEX idx_resume_logs_action ON resume_usage_logs(action);
+#   CREATE INDEX idx_resume_logs_date   ON resume_usage_logs(created_at DESC);
+#
+# ───────────────────────────────────────────────────────────────────────────────
 
+@app.route("/api/resume/log", methods=["POST"])
+def log_resume_usage():
+    """
+    Log resume generation / JD analysis / JD rebuild to Postgres.
+    Called by the frontend after each action.
+    """
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+
+    action         = data.get("action", "")
+    candidate_name = data.get("candidateName", "")
+    country        = data.get("country", "")
+    template_name  = data.get("template", "")
+    file_name      = data.get("fileName", "")
+    match_score    = data.get("matchScore")
+    match_label    = data.get("matchLabel", "")
+
+    if action not in ("generate", "jd_analysis", "jd_rebuild"):
+        return jsonify({"message": "Invalid action"}), 400
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        # Get current user name for the log
+        cur.execute("SELECT name FROM users WHERE user_id = %s", (session["user_id"],))
+        user_row = cur.fetchone()
+        employee_name = user_row[0] if user_row else "Unknown"
+
+        cur.execute("""
+            INSERT INTO resume_usage_logs
+                (user_id, employee_name, action, candidate_name, country,
+                 template_name, file_name, match_score, match_label)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING id, created_at
+        """, (
+            session["user_id"], employee_name, action, candidate_name,
+            country, template_name, file_name,
+            int(match_score) if match_score is not None else None,
+            match_label or None
+        ))
+        row = cur.fetchone()
+        conn.commit()
+
+        # Emit real-time update to chairman dashboard
+        socketio.emit("resume_log_added", {
+            "id":            row[0],
+            "employee_name": employee_name,
+            "action":        action,
+            "candidate_name": candidate_name,
+            "country":       country,
+            "template_name": template_name,
+            "created_at":    row[1].isoformat(),
+        }, room="resume_dashboard")
+
+        return jsonify({"message": "Logged", "id": row[0]}), 201
+
+    except Exception as e:
+        conn.rollback()
+        print(f"❌ resume log error: {e}")
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+@app.route("/api/resume/stats", methods=["GET"])
+def get_resume_stats():
+    """
+    Chairman-only: Full analytics for the dashboard.
+    Returns aggregate stats + paginated log entries.
+    """
+    if "user_id" not in session:
+        return jsonify({"message": "Unauthorized"}), 401
+
+    if session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+
+    page     = int(request.args.get("page", 1))
+    per_page = int(request.args.get("per_page", 50))
+    action_f = request.args.get("action", "")   # filter by action
+    search   = request.args.get("search", "")   # search candidate/employee name
+    offset   = (page - 1) * per_page
+
+    conn = get_db_connection()
+    cur  = conn.cursor(cursor_factory=RealDictCursor)
+    try:
+        # ── Aggregate stats ──────────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                COUNT(*) FILTER (WHERE action = 'generate')    AS total_generated,
+                COUNT(*) FILTER (WHERE action = 'jd_analysis') AS total_analyses,
+                COUNT(*) FILTER (WHERE action = 'jd_rebuild')  AS total_rebuilds,
+                COUNT(*)                                        AS total_actions,
+                ROUND(AVG(match_score) FILTER (WHERE action='jd_analysis' AND match_score IS NOT NULL)) AS avg_match_score
+            FROM resume_usage_logs
+        """)
+        agg = dict(cur.fetchone())
+
+        # ── Top countries ────────────────────────────────────────────────
+        cur.execute("""
+            SELECT country, COUNT(*) AS cnt
+            FROM resume_usage_logs
+            WHERE action = 'generate' AND country IS NOT NULL AND country != ''
+            GROUP BY country
+            ORDER BY cnt DESC
+            LIMIT 8
+        """)
+        top_countries = [dict(r) for r in cur.fetchall()]
+
+        # ── Top templates ────────────────────────────────────────────────
+        cur.execute("""
+            SELECT template_name, COUNT(*) AS cnt
+            FROM resume_usage_logs
+            WHERE action = 'generate' AND template_name IS NOT NULL AND template_name != ''
+            GROUP BY template_name
+            ORDER BY cnt DESC
+            LIMIT 6
+        """)
+        top_templates = [dict(r) for r in cur.fetchall()]
+
+        # ── Top employees ────────────────────────────────────────────────
+        cur.execute("""
+            SELECT employee_name, COUNT(*) AS cnt
+            FROM resume_usage_logs
+            WHERE employee_name IS NOT NULL
+            GROUP BY employee_name
+            ORDER BY cnt DESC
+            LIMIT 6
+        """)
+        top_employees = [dict(r) for r in cur.fetchall()]
+
+        # ── Last 14 days activity ────────────────────────────────────────
+        cur.execute("""
+            SELECT
+                DATE(created_at AT TIME ZONE 'Asia/Kolkata') AS day,
+                COUNT(*) AS cnt
+            FROM resume_usage_logs
+            WHERE created_at >= NOW() - INTERVAL '14 days'
+            GROUP BY day
+            ORDER BY day ASC
+        """)
+        daily_activity = [{"day": str(r["day"]), "cnt": r["cnt"]} for r in cur.fetchall()]
+
+        # ── Paginated log entries ────────────────────────────────────────
+        where_clauses = []
+        params        = []
+
+        if action_f and action_f != "all":
+            where_clauses.append("action = %s")
+            params.append(action_f)
+
+        if search:
+            where_clauses.append(
+                "(LOWER(candidate_name) LIKE %s OR LOWER(employee_name) LIKE %s)"
+            )
+            like = f"%{search.lower()}%"
+            params.extend([like, like])
+
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        # Total count for pagination
+        cur.execute(f"SELECT COUNT(*) FROM resume_usage_logs {where_sql}", params)
+        total_count = cur.fetchone()["count"]
+
+        # Actual rows
+        cur.execute(f"""
+            SELECT id, user_id, employee_name, action, candidate_name,
+                   country, template_name, file_name, match_score, match_label,
+                   created_at AT TIME ZONE 'Asia/Kolkata' AS created_at
+            FROM resume_usage_logs
+            {where_sql}
+            ORDER BY created_at DESC
+            LIMIT %s OFFSET %s
+        """, params + [per_page, offset])
+
+        logs = []
+        for r in cur.fetchall():
+            row = dict(r)
+            row["created_at"] = row["created_at"].isoformat() if row["created_at"] else None
+            logs.append(row)
+
+        return jsonify({
+            "stats": {
+                **agg,
+                "top_countries": top_countries,
+                "top_templates": top_templates,
+                "top_employees": top_employees,
+                "daily_activity": daily_activity,
+            },
+            "logs":        logs,
+            "total_count": total_count,
+            "page":        page,
+            "per_page":    per_page,
+        }), 200
+
+    except Exception as e:
+        print(f"❌ resume stats error: {e}")
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+@app.route("/api/resume/logs/clear", methods=["DELETE"])
+def clear_resume_logs():
+    """Chairman only: clear all resume usage logs."""
+    if "user_id" not in session or session.get("role") != "chairman":
+        return jsonify({"message": "Chairman only"}), 403
+
+    conn = get_db_connection()
+    cur  = conn.cursor()
+    try:
+        cur.execute("DELETE FROM resume_usage_logs")
+        count = cur.rowcount
+        conn.commit()
+        return jsonify({"message": f"Cleared {count} logs"}), 200
+    except Exception as e:
+        conn.rollback()
+        return jsonify({"message": str(e)}), 500
+    finally:
+        cur.close()
+        put_db_connection(conn)
+
+
+# ── SocketIO: Resume dashboard room ──────────────────────────────────────────
+@socketio.on("join_resume_dashboard")
+def handle_join_resume_dashboard():
+    from flask_socketio import join_room
+    if session.get("role") == "chairman":
+        join_room("resume_dashboard")
+        emit("joined_resume_dashboard", {"ok": True})
+
+# ==================== END RESUME ROUTES ====================
 if __name__ == "__main__":
     app.run(debug=True, port=5000)
 # ==================== END CHAT ROUTES ====================
