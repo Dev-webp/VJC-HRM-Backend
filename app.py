@@ -2647,13 +2647,13 @@ def admin_get_employees():
             if role in ("mis-execuitve", "mis-executive") and emp_loc != user_location:
                 continue
 
-        result.append({
-                "id": emp[0],
-                "name": emp[1],
-                "role": emp[2],
-                "location": emp[3],
-                "department": emp[4],
-            })
+            result.append({
+                    "id": emp[0],
+                    "name": emp[1],
+                    "role": emp[2],
+                    "location": emp[3],
+                    "department": emp[4],
+                })
 
         print(f"✅ Returning {len(result)} employees for role={role}")
         return jsonify(result), 200
