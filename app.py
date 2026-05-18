@@ -2550,10 +2550,13 @@ def admin_get_attendance():
         emp = cur.fetchone()
         emp_location = emp[0].lower() if emp and emp[0] else ""
         print("👀 Employee location:", emp_location)
-
-        # 🛡️ Managers can only see same-location data
+# 🛡️ Managers can only see same-location data
         if role == "manager" and emp_location != user_location:
             print("🚫 Manager tried to access other location data:", emp_location)
+            return jsonify({"message": "Access denied: different location"}), 403
+
+        # 🔒 MIS Executive → only same location
+        if role in ("mis-execuitve", "mis-executive") and emp_location != user_location:
             return jsonify({"message": "Access denied: different location"}), 403
 
         cur.execute("""
@@ -2636,12 +2639,15 @@ def admin_get_employees():
             # 🧩 Manager → only same-location employees
             if role == "manager" and emp_loc != user_location:
                 continue
-
             # 🚫 Hide Chairman only (show all others)
             if "chairman" in emp_role:
                 continue
 
-            result.append({
+            # 🔒 MIS Executive → only same location
+            if role in ("mis-execuitve", "mis-executive") and emp_loc != user_location:
+                continue
+
+        result.append({
                 "id": emp[0],
                 "name": emp[1],
                 "role": emp[2],
